@@ -1,0 +1,551 @@
+// Values: what expressions of a build script evaluate to, their types, and the modules builds produce
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::rc::Rc;
+
+use crate::common::up_to_date::InputFingerprint;
+use crate::common::{system, xml};
+use crate::jvm::{self, JvmOutput};
+
+use super::functions::{BuiltinFunction, FunctionSignature, UserFunction};
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    String(String),
+    Int(i64),
+    Bool(bool),
+    List(Vec<Value>),
+    Module(Rc<BuiltModule>),
+    Unit,
+    Builtin {
+        name: &'static str,
+        signature: Rc<FunctionSignature>,
+        function: BuiltinFunction,
+    },
+    /// defined by the script with fn (...) { ... }
+    Function(Rc<UserFunction>),
+}
+
+/// Types of values, checked whenever arguments are bound to parameters. They
+/// are written like in scripts: str, list<str>, fn(str) -> bool
+#[derive(Debug, Clone)]
+pub enum Type {
+    Any,
+    Unit,
+    Bool,
+    Int,
+    String,
+    Module,
+    List(Box<Type>),
+    Function(Rc<FunctionSignature>),
+    /// one of several types: str | module
+    Union(Vec<Type>),
+}
+
+/// What building a module produced. Other modules can depend on it, like
+/// `implementation(project(":core"))` in Gradle.
+#[derive(Debug)]
+pub struct BuiltModule {
+    pub name: String,
+    /// where the module lives, programs run there
+    pub directory: PathBuf,
+    /// the file to run or install, what the module is in a script
+    pub artifact: PathBuf,
+    /// modules of the script it depends on
+    pub modules: Vec<Rc<BuiltModule>>,
+    pub output: ModuleOutput,
+    /// empty when `build-script test` did not select it
+    pub tests: Vec<TestSuite>,
+}
+
+/// Tests of one source set of a module, like src/test or src/androidTest
+#[derive(Debug)]
+pub struct TestSuite {
+    pub source_set: &'static str,
+    pub tests: ModuleTests,
+}
+
+/// The tests of a module `build-script test` selected. They run once the whole
+/// script is built, unless their outcome is clear before.
+#[derive(Debug)]
+pub enum ModuleTests {
+    Run(Box<dyn TestRunner>),
+    /// without running anything: no tests, up to date, not compiled
+    Known(TestOutcome),
+}
+
+/// Runs compiled tests: a command line, or what a platform needs besides, like a device
+pub trait TestRunner: fmt::Debug {
+    /// A failure is the outcome, not an error
+    fn run(&self, module: &str) -> TestOutcome;
+}
+
+/// The command line that runs the compiled tests of a module
+#[derive(Debug)]
+pub struct TestRun {
+    /// for the log: JUnit Platform 1.14.4
+    pub runner: String,
+    program: OsString,
+    args: Vec<OsString>,
+    envs: Vec<(OsString, Option<OsString>)>,
+    directory: Option<PathBuf>,
+    /// emptied before the run, the JUnit XML reports the run writes there count
+    reports_dir: PathBuf,
+    /// stored once the tests passed, they do not run again until their inputs change
+    fingerprint: InputFingerprint,
+}
+
+/// What `build-script test` found for a module. A failure is an outcome, not an
+/// error: the other modules still build and run their tests.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TestOutcome {
+    NoTests,
+    /// neither the tests nor what they test changed since they last passed
+    UpToDate,
+    Passed(Option<TestCounts>),
+    /// the tests failed, or could not be compiled or started
+    Failed {
+        counts: Option<TestCounts>,
+        error: String,
+    },
+}
+
+/// From JUnit XML reports, which the test runners of most languages can write
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TestCounts {
+    pub tests: u32,
+    /// failures and errors
+    pub failed: u32,
+    pub skipped: u32,
+}
+
+/// What modules of a language category keep for the modules depending on them
+/// and for `build-script run`
+#[derive(Debug)]
+pub enum ModuleOutput {
+    Jvm(JvmOutput),
+}
+
+/// Starts what a module built and returns the exit code for the process
+pub fn launch(module: &BuiltModule, args: &[String]) -> Result<i32, String> {
+    match &module.output {
+        ModuleOutput::Jvm(output) => return jvm::launch(module, output, args),
+    }
+}
+
+impl Value {
+    pub fn type_of(&self) -> Type {
+        match self {
+            Value::String(_) => return Type::String,
+            Value::Int(_) => return Type::Int,
+            Value::Bool(_) => return Type::Bool,
+            Value::Module(_) => return Type::Module,
+            Value::Unit => return Type::Unit,
+            Value::List(items) => {
+                let element = match items.split_first() {
+                    Some((first, rest)) => {
+                        let first = first.type_of();
+                        if rest.iter().all(|item| item.type_of() == first) {
+                            first
+                        } else {
+                            Type::Any
+                        }
+                    }
+                    None => Type::Any,
+                };
+                return Type::list(element);
+            }
+            Value::Builtin { signature, .. } => return Type::Function(signature.clone()),
+            Value::Function(function) => return Type::Function(function.signature.clone()),
+        }
+    }
+
+    pub fn string_list(values: &[&str]) -> Value {
+        return Value::List(values.iter().map(|value| Value::from(*value)).collect());
+    }
+
+    /// How the value is written in a script: strings with quotes
+    pub fn literal(&self) -> String {
+        match self {
+            Value::String(str) => return format!("\"{str}\""),
+            other => return other.to_string(),
+        }
+    }
+}
+
+impl Type {
+    pub fn list(element: Type) -> Self {
+        return Type::List(Box::new(element));
+    }
+
+    pub fn accepts(&self, value: &Value) -> bool {
+        match (self, value) {
+            (Type::Any, _) => return true,
+            (Type::Unit, Value::Unit) => return true,
+            (Type::Bool, Value::Bool(_)) => return true,
+            (Type::Int, Value::Int(_)) => return true,
+            (Type::String, Value::String(_)) => return true,
+            (Type::Module, Value::Module(_)) => return true,
+            (Type::List(element), Value::List(items)) => {
+                return items.iter().all(|item| element.accepts(item));
+            }
+            (Type::Union(types), _) => {
+                return types.iter().any(|member_type| member_type.accepts(value));
+            }
+            (Type::Function(_), Value::Builtin { .. } | Value::Function(_)) => {
+                return value.type_of() == *self;
+            }
+            _ => return false,
+        }
+    }
+}
+
+impl ModuleTests {
+    pub fn run(&self, module: &str) -> TestOutcome {
+        match self {
+            ModuleTests::Run(run) => return run.run(module),
+            ModuleTests::Known(outcome) => return outcome.clone(),
+        }
+    }
+}
+
+impl TestRun {
+    pub fn new(
+        runner: String,
+        command: &Command,
+        reports_dir: PathBuf,
+        fingerprint: InputFingerprint,
+    ) -> Self {
+        return TestRun {
+            runner,
+            program: command.get_program().to_os_string(),
+            args: command.get_args().map(OsStr::to_os_string).collect(),
+            envs: command
+                .get_envs()
+                .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
+                .collect(),
+            directory: command.get_current_dir().map(Path::to_path_buf),
+            reports_dir,
+            fingerprint,
+        };
+    }
+}
+
+impl TestRunner for TestRun {
+    fn run(&self, module: &str) -> TestOutcome {
+        system::log(module, &format!("Running tests with {}", self.runner));
+
+        if let Err(error) = system::recreate_dir(&self.reports_dir) {
+            return TestOutcome::Failed {
+                counts: None,
+                error,
+            };
+        }
+
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+
+        for (key, value) in &self.envs {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+
+        if let Some(directory) = &self.directory {
+            command.current_dir(directory);
+        }
+
+        let result = system::run(&mut command, "tests");
+        let counts = TestCounts::read_junit_reports(&self.reports_dir);
+
+        if let Err(error) = result {
+            return TestOutcome::Failed { counts, error };
+        }
+
+        if let Err(error) = self.fingerprint.store() {
+            system::log(
+                module,
+                &format!("the tests passed, but run again next time: {error}"),
+            );
+        }
+
+        return TestOutcome::Passed(counts);
+    }
+}
+
+impl TestCounts {
+    /// Summed over the TEST-*.xml reports in the directory, None without any
+    pub fn read_junit_reports(directory: &Path) -> Option<Self> {
+        let mut counts: Option<TestCounts> = None;
+
+        for report in system::files_with_extension(&[directory.to_path_buf()], "xml") {
+            if !report
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("TEST-"))
+            {
+                continue;
+            }
+
+            let Ok(root) = system::read_file(&report).and_then(|content| xml::parse(&content))
+            else {
+                continue;
+            };
+
+            // a file has one suite, or several in <testsuites>
+            let suites: Vec<&xml::XmlElement> = match root.name.as_str() {
+                "testsuites" => root.children("testsuite").collect(),
+                _ => vec![&root],
+            };
+
+            let total = counts.get_or_insert_with(TestCounts::default);
+            for suite in suites {
+                let count = |name: &str| {
+                    suite
+                        .attribute(name)
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .unwrap_or(0)
+                };
+
+                total.tests += count("tests");
+                total.failed += count("failures") + count("errors");
+                total.skipped += count("skipped");
+            }
+        }
+
+        return counts;
+    }
+}
+
+impl BuiltModule {
+    /// The given modules and everything they depend on, each once, dependencies first
+    pub fn transitive(modules: &[Rc<BuiltModule>]) -> Vec<Rc<BuiltModule>> {
+        // a module reached again is not descended into again: modules many
+        // others depend on would be visited once per path to them
+        fn visit(
+            module: &Rc<BuiltModule>,
+            seen: &mut HashSet<*const BuiltModule>,
+            out: &mut Vec<Rc<BuiltModule>>,
+        ) {
+            if !seen.insert(Rc::as_ptr(module)) {
+                return;
+            }
+
+            for dependency in &module.modules {
+                visit(dependency, seen, out);
+            }
+
+            out.push(module.clone());
+        }
+
+        let mut seen = HashSet::new();
+        let mut out = vec![];
+
+        for module in modules {
+            visit(module, &mut seen, &mut out);
+        }
+
+        return out;
+    }
+
+    /// Whether `build-script run` can start it
+    pub fn can_launch(&self) -> bool {
+        match &self.output {
+            ModuleOutput::Jvm(output) => return output.launch.is_some(),
+        }
+    }
+}
+
+/// What fingerprints of build arguments see: modules by name and artifact,
+/// what they produced is hashed once per module by the build that uses them
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::String(str) => str.hash(state),
+            Value::Int(int) => int.hash(state),
+            Value::Bool(bool) => bool.hash(state),
+            Value::List(items) => items.hash(state),
+            Value::Module(module) => {
+                module.name.hash(state);
+                module.artifact.hash(state);
+            }
+            Value::Unit => {}
+            Value::Builtin { name, .. } => name.hash(state),
+            Value::Function(function) => function.name.hash(state),
+        }
+    }
+}
+
+/// Structural equality. Function types are equal when their parameters have the
+/// same types and are required in the same places, names and default values
+/// do not matter.
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Type::Any, Type::Any)
+            | (Type::Unit, Type::Unit)
+            | (Type::Bool, Type::Bool)
+            | (Type::Int, Type::Int)
+            | (Type::String, Type::String)
+            | (Type::Module, Type::Module) => return true,
+            (Type::List(l), Type::List(r)) => return l == r,
+            (Type::Union(l), Type::Union(r)) => return l == r,
+            (Type::Function(l), Type::Function(r)) => return l.same_shape(r),
+            _ => return false,
+        }
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Value::String(str) => return write!(f, "{str}"),
+            Value::Int(int) => return write!(f, "{int}"),
+            Value::Bool(bool) => return write!(f, "{bool}"),
+            Value::Module(module) => return write!(f, "{}", module.artifact.display()),
+            Value::List(items) => {
+                let items: Vec<String> = items.iter().map(|item| item.to_string()).collect();
+                return write!(f, "[{}]", items.join(", "));
+            }
+            Value::Unit => return write!(f, "()"),
+            Value::Builtin { name, .. } => return write!(f, "<builtin {name}>"),
+            Value::Function(function) => return write!(f, "<fn {}>", function.name),
+        }
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Type::Any => return write!(f, "any"),
+            Type::Unit => return write!(f, "unit"),
+            Type::Bool => return write!(f, "bool"),
+            Type::Int => return write!(f, "int"),
+            Type::String => return write!(f, "str"),
+            Type::Module => return write!(f, "module"),
+            Type::List(element) => return write!(f, "list<{element}>"),
+            Type::Function(signature) => return write!(f, "{signature}"),
+            Type::Union(types) => {
+                let names: Vec<String> = types
+                    .iter()
+                    .map(|member_type| member_type.to_string())
+                    .collect();
+                return write!(f, "{}", names.join(" | "));
+            }
+        }
+    }
+}
+
+impl From<&str> for Value {
+    fn from(value: &str) -> Self {
+        return Value::String(value.to_string());
+    }
+}
+
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        return Value::String(value);
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        return Value::Bool(value);
+    }
+}
+
+impl From<i64> for Value {
+    fn from(value: i64) -> Self {
+        return Value::Int(value);
+    }
+}
+
+impl From<Rc<BuiltModule>> for Value {
+    fn from(value: Rc<BuiltModule>) -> Self {
+        return Value::Module(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn junit_reports_are_summed() {
+        let dir = std::env::temp_dir().join(format!("build-script-reports-{}", std::process::id()));
+        system::recreate_dir(&dir).unwrap();
+        assert_eq!(TestCounts::read_junit_reports(&dir), None);
+
+        // one suite per engine, like the JUnit Platform writes them
+        system::write_file(
+            &dir.join("TEST-junit-jupiter.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="JUnit Jupiter" tests="5" skipped="1" failures="1" errors="0">
+<testcase name="adds()"><system-out><![CDATA[<not a tag>]]></system-out></testcase>
+</testsuite>"#,
+        )
+        .unwrap();
+        system::write_file(&dir.join("TEST-several.xml"), r#"<testsuites><testsuite tests="2" failures="0" errors="1"/><testsuite tests="1"/></testsuites>"#).unwrap();
+        // not a report
+        system::write_file(&dir.join("junit-platform-events.xml"), "<events/>").unwrap();
+
+        assert_eq!(
+            TestCounts::read_junit_reports(&dir),
+            Some(TestCounts {
+                tests: 8,
+                failed: 2,
+                skipped: 1
+            })
+        );
+        system::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_runs_count_their_own_reports_and_remember_passing() {
+        let dir =
+            std::env::temp_dir().join(format!("build-script-test-run-{}", std::process::id()));
+
+        system::recreate_dir(&dir).unwrap();
+        let fingerprint = dir.join("fingerprint");
+
+        let test_run = |script: &str| {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(script).current_dir(&dir);
+
+            return TestRun::new(
+                "sh".to_string(),
+                &command,
+                dir.join("reports"),
+                InputFingerprint::new(fingerprint.clone()),
+            );
+        };
+
+        let failing =
+            test_run(r#"echo '<testsuite tests="2" failures="1"/>' > reports/TEST-sh.xml; exit 1"#);
+
+        let counts = Some(TestCounts {
+            tests: 2,
+            failed: 1,
+            skipped: 0,
+        });
+
+        assert_eq!(
+            failing.run("core"),
+            TestOutcome::Failed {
+                counts,
+                error: "tests failed (exit status: 1)".to_string()
+            }
+        );
+        assert!(!fingerprint.exists());
+
+        // the report of the failed run is gone
+        assert_eq!(test_run("true").run("core"), TestOutcome::Passed(None));
+        assert!(fingerprint.exists());
+        system::remove_dir(&dir).unwrap();
+    }
+}
