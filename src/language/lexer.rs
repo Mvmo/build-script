@@ -5,18 +5,12 @@ pub struct Span {
 }
 
 impl Span {
-    fn new(start: usize, end: usize) -> Self {
-        return Span {
-            start,
-            end
-        }
+    pub fn till(&self, end: Span) -> Span {
+        return Span::new(self.start, end.end);
     }
 
-    pub fn till(&self, end: Span) -> Span {
-        return Span::new(
-            self.start,
-            end.end
-        )
+    fn new(start: usize, end: usize) -> Self {
+        return Span { start, end };
     }
 }
 
@@ -28,10 +22,7 @@ pub struct Token {
 
 impl Token {
     pub fn new(variant: TokenType, span: Span) -> Self {
-        return Token {
-            variant,
-            span
-        }
+        return Token { variant, span };
     }
 }
 
@@ -39,6 +30,7 @@ impl Token {
 pub enum TokenType {
     // Keywords
     Use,
+    Fn,
 
     // Operators
     EqEq,
@@ -53,7 +45,16 @@ pub enum TokenType {
     // Parens
     LeftParen,
     RightParen,
+    LeftBrace,
+    RightBrace,
     Comma,
+
+    // Types
+    Colon,
+    Arrow,
+    Less,
+    Greater,
+    Pipe,
 
     Ident(String),
     String(String),
@@ -65,6 +66,7 @@ impl ToString for TokenType {
     fn to_string(&self) -> String {
         return String::from(match self {
             TokenType::Use => "use",
+            TokenType::Fn => "fn",
             TokenType::EqEq => "==",
             TokenType::BangEq => "!=",
             TokenType::Eq => "=",
@@ -75,21 +77,36 @@ impl ToString for TokenType {
             TokenType::Bang => "!",
             TokenType::LeftParen => "(",
             TokenType::RightParen => ")",
+            TokenType::LeftBrace => "{",
+            TokenType::RightBrace => "}",
             TokenType::Comma => ",",
+            TokenType::Colon => ":",
+            TokenType::Arrow => "->",
+            TokenType::Less => "<",
+            TokenType::Greater => ">",
+            TokenType::Pipe => "|",
             TokenType::Ident(ident) => ident,
             TokenType::String(str) => str,
             TokenType::EOF => "<<EOF>>",
-        })
+        });
     }
 }
 
+// longer symbols first: "->" before "-"
 const CONTROL_SYMBOLS: &[(&'static str, TokenType)] = &[
     ("(", TokenType::LeftParen),
     (")", TokenType::RightParen),
+    ("{", TokenType::LeftBrace),
+    ("}", TokenType::RightBrace),
     (",", TokenType::Comma),
+    (":", TokenType::Colon),
+    ("<", TokenType::Less),
+    (">", TokenType::Greater),
+    ("|", TokenType::Pipe),
     ("==", TokenType::EqEq),
     ("!=", TokenType::BangEq),
     ("=", TokenType::Eq),
+    ("->", TokenType::Arrow),
     ("-", TokenType::Minus),
     ("+", TokenType::Plus),
     ("*", TokenType::Star),
@@ -106,15 +123,12 @@ const fn control_chars() -> [char; CONTROL_SYMBOLS.len()] {
         index += 1;
     }
 
-    return out
+    return out;
 }
 
 const CONTROL_CHARS: [char; CONTROL_SYMBOLS.len()] = control_chars();
 
-const KEYWORDS: &[(&'static str, TokenType)] = &[
-    ("use", TokenType::Use),
-];
-
+const KEYWORDS: &[(&'static str, TokenType)] = &[("use", TokenType::Use), ("fn", TokenType::Fn)];
 
 pub struct TokenStream<'src> {
     pub input: &'src str,
@@ -125,46 +139,40 @@ impl<'src> TokenStream<'src> {
     pub fn new(input: &'src str) -> Self {
         return TokenStream {
             input: input,
-            current_pos: 0
-        }
+            current_pos: 0,
+        };
     }
 
     pub fn lex_token(&self, pos: usize) -> Token {
-        let mut current_pos = pos;
-
-        let remaining = &self.input[current_pos..];
-        let trimmed = remaining.trim_start();
-
-        let diff = remaining.len() - trimmed.len();
-        current_pos += diff;
+        let mut current_pos = self.skip_whitespace_and_comments(pos);
+        let trimmed = &self.input[current_pos..];
 
         let start_pos = current_pos;
 
         let first_char = if let Some(next_char) = trimmed.chars().next() {
             next_char
         } else {
-            return Token { variant: TokenType::EOF, span: Span::new(start_pos, start_pos) }
+            return Token {
+                variant: TokenType::EOF,
+                span: Span::new(start_pos, start_pos),
+            };
         };
 
         if first_char == '"' {
-            let closing_index = trimmed[1..].find('"')
-                .expect("expected closing \"");
+            let closing_index = trimmed[1..].find('"').expect("expected closing \"");
 
             let str_content = &trimmed[1..closing_index + 1];
             current_pos += str_content.len() + 2; // closing and opening "
 
-            return Token::new(TokenType::String(str_content.to_string()), Span::new(
-                start_pos,
-                current_pos
-            ))
+            return Token::new(
+                TokenType::String(str_content.to_string()),
+                Span::new(start_pos, current_pos),
+            );
         };
 
         if let Some((variant, len)) = Self::control_symbol(trimmed) {
             current_pos += len;
-            return Token::new(
-                variant,
-                Span::new(start_pos, current_pos)
-            )
+            return Token::new(variant, Span::new(start_pos, current_pos));
         };
 
         let maybe_ident_len = trimmed
@@ -175,34 +183,50 @@ impl<'src> TokenStream<'src> {
         current_pos += maybe_ident_len;
 
         if let Some(keyword) = Self::keyword(maybe_ident) {
-            return Token::new(keyword, Span::new(
-                start_pos,
-                current_pos
-            ))
+            return Token::new(keyword, Span::new(start_pos, current_pos));
         };
 
         return Token::new(
             TokenType::Ident(maybe_ident.to_string()),
-            Span::new(
-                start_pos,
-                current_pos
-            ),
-        )
+            Span::new(start_pos, current_pos),
+        );
     }
 
     pub fn next(&mut self) -> Token {
         let token = self.lex_token(self.current_pos);
         self.current_pos = token.span.end;
 
-        return token
+        return token;
     }
 
     pub fn peek(&self) -> Token {
-        return self.lex_token(self.current_pos)
+        return self.lex_token(self.current_pos);
     }
 
     pub fn eat_next(&mut self) {
         let _ = self.next();
+    }
+
+    /// Position of the next token: whitespace, `// …` up to the end of the line
+    /// and `/* … */` are skipped
+    fn skip_whitespace_and_comments(&self, pos: usize) -> usize {
+        let mut current_pos = pos;
+        loop {
+            let remaining = &self.input[current_pos..];
+            let trimmed = remaining.trim_start();
+            current_pos += remaining.len() - trimmed.len();
+
+            if trimmed.starts_with("//") {
+                current_pos += trimmed.find('\n').unwrap_or(trimmed.len());
+            } else if trimmed.starts_with("/*") {
+                current_pos += trimmed
+                    .find("*/")
+                    .map(|end| end + 2)
+                    .unwrap_or(trimmed.len());
+            } else {
+                return current_pos;
+            }
+        }
     }
 
     fn control_symbol(remaining: &str) -> Option<(TokenType, usize)> {
@@ -218,10 +242,10 @@ impl<'src> TokenStream<'src> {
     fn keyword(chain: &str) -> Option<TokenType> {
         for (symbol, token) in KEYWORDS {
             if *symbol == chain {
-                return Some(token.clone())
+                return Some(token.clone());
             }
         }
 
-        return None
+        return None;
     }
 }
