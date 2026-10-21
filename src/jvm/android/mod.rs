@@ -1,0 +1,562 @@
+// Android: apps and libraries built without the Android Gradle plugin
+mod build;
+mod device;
+mod generated;
+mod manifest;
+mod sdk;
+
+use std::path::{Path, PathBuf};
+
+use crate::common::system;
+use crate::common::xml::{self, XmlElement};
+use crate::jvm::JvmLaunch;
+use crate::jvm::maven::{MavenCoordinate, TargetPlatform};
+use crate::jvm::module::{
+    Dependencies, ModuleBuildInputs, Sources, dependencies_type, kotlin_and_java_sources,
+    module_params, source_set_dirs,
+};
+use crate::jvm::testing::{UnitTests, unit_test_params};
+use crate::language::runtime::{
+    Args, BuildScriptContext, FunctionParams, FunctionSignature, ModuleTests, TestOutcome,
+    TestSuite, Type, Value, builtin,
+};
+
+use build::{
+    AndroidBuild, DEFAULT_NDK_VERSION, android_input_paths, existing_dirs, merge_java_resources,
+    native_library_dirs, read_android_inputs,
+};
+use device::InstrumentedTests;
+use generated::SymbolTable;
+use manifest::{launcher_activity, read_manifest_with_placeholders};
+use sdk::AndroidSdk;
+
+pub use device::install_and_start;
+
+pub const DEFAULT_COMPILE_SDK: i64 = 36;
+pub const DEFAULT_MIN_SDK: i64 = 24;
+pub const DEFAULT_BUILD_TOOLS: &str = "36.1.0";
+/// What consumers of an Android library need besides its classes
+#[derive(Debug, Hash)]
+pub struct AndroidResources {
+    pub namespace: String,
+    /// res directories with files, lowest priority first
+    pub res_dirs: Vec<PathBuf>,
+    /// merged into the manifest of apps using the library
+    pub manifest: Option<PathBuf>,
+    /// R.txt: the resources of the library's R class
+    pub symbols: Option<PathBuf>,
+    /// assets directories with files, lowest priority first
+    pub asset_dirs: Vec<PathBuf>,
+    /// jniLibs directories with <abi>/*.so, lowest priority first
+    pub native_library_dirs: Vec<PathBuf>,
+    /// the library has <Layout>Binding classes in <namespace>.databinding
+    pub view_binding: bool,
+}
+
+pub fn builtins() -> Vec<(&'static str, Value)> {
+    let app = android_params(
+        FunctionParams::new()
+            .required("name", Type::String)
+            .required("namespace", Type::String)
+            .required("dependencies", dependencies_type())
+            .required("repositories", Type::list(Type::String))
+            .optional("application_id", Type::String)
+            .with_default("min_sdk", Type::Int, DEFAULT_MIN_SDK)
+            .optional("target_sdk", Type::Int)
+            .with_default("compile_sdk", Type::Int, DEFAULT_COMPILE_SDK)
+            .with_default("version_code", Type::Int, 1i64)
+            .with_default("version_name", Type::String, "1.0")
+            .optional("core_library_desugaring", Type::String)
+            // asset name of a JSON report of the libraries' licenses
+            .optional("license_report", Type::String),
+    );
+
+    let library = android_params(
+        FunctionParams::new()
+            .required("name", Type::String)
+            .required("namespace", Type::String)
+            .required("dependencies", dependencies_type())
+            .required("repositories", Type::list(Type::String))
+            .with_default("min_sdk", Type::Int, DEFAULT_MIN_SDK)
+            .with_default("compile_sdk", Type::Int, DEFAULT_COMPILE_SDK),
+    );
+
+    return vec![
+        (
+            "build_android",
+            builtin("build_android", app, build_android),
+        ),
+        (
+            "build_android_library",
+            builtin("build_android_library", library, build_android_library),
+        ),
+    ];
+}
+
+/// Those of build_kotlin and those of Android modules. Debug builds: the debug
+/// source set lies over main, like with the Gradle plugin.
+fn android_params(params: FunctionParams) -> FunctionSignature {
+    let source_sets = &["main", "debug"];
+    return unit_test_params(
+        module_params(params, source_sets, Sources::KotlinAndJava),
+        Sources::KotlinAndJava,
+    )
+    // "name=value" for ${name} in the manifests
+    .with_default(
+        "manifest_placeholders",
+        Type::list(Type::String),
+        Value::string_list(&[]),
+    )
+    .with_default("view_binding", Type::Bool, false)
+    // like android.nonTransitiveRClass, the default since Android Gradle plugin 8
+    .with_default("non_transitive_r_class", Type::Bool, true)
+    // "Type NAME value", like buildConfigField in Gradle
+    .with_default(
+        "build_config_fields",
+        Type::list(Type::String),
+        Value::string_list(&[]),
+    )
+    .with_default(
+        "res_dirs",
+        Type::list(Type::String),
+        source_set_dirs(source_sets, &["res"]),
+    )
+    .with_default(
+        "asset_dirs",
+        Type::list(Type::String),
+        source_set_dirs(source_sets, &["assets"]),
+    )
+    .with_default(
+        "aidl_dirs",
+        Type::list(Type::String),
+        source_set_dirs(source_sets, &["aidl"]),
+    )
+    // like externalNativeBuild { cmake { path } }: native libraries built with the NDK
+    .optional("cmake", Type::String)
+    .with_default("ndk_version", Type::String, DEFAULT_NDK_VERSION)
+    .with_default("build_tools", Type::String, DEFAULT_BUILD_TOOLS)
+    // for builds without a terminal to ask about the SDK license
+    .with_default("accept_sdk_license", Type::Bool, false)
+    // like androidTestImplementation: the instrumented tests, which run on a device
+    .with_default(
+        "android_test_dependencies",
+        dependencies_type(),
+        Value::string_list(&[]),
+    )
+    .with_default(
+        "android_test_source_dirs",
+        Type::list(Type::String),
+        source_set_dirs(&["androidTest"], &["kotlin", "java"]),
+    )
+    .with_default(
+        "test_instrumentation_runner",
+        Type::String,
+        DEFAULT_TEST_RUNNER,
+    )
+    .returns(Type::Module);
+}
+
+/// A debug apk in build/outputs/apk/debug/<name>-debug.apk: resources with
+/// aapt2, Kotlin against android.jar, dex with d8, aligned and signed with
+/// the debug key
+fn build_android(context: &BuildScriptContext, args: &Args) -> Result<Value, String> {
+    let inputs = read_android_inputs(context, args)?;
+    let settings = ApkSettings::of_app(args)?;
+    let namespace: String = args.get("namespace")?;
+    let build_dir = inputs.directory.join("build");
+    let manifest = build_dir.join("intermediates/manifest/AndroidManifest.xml");
+    let apk = build_dir.join(format!("outputs/apk/debug/{}-debug.apk", inputs.name));
+
+    let fingerprint =
+        inputs.input_fingerprint(&inputs.name, args, &android_input_paths(&inputs, args)?)?;
+
+    let (inputs, sdk, merged_manifest) =
+        if inputs.is_up_to_date(&fingerprint, &[&apk, &manifest])? {
+            let merged_manifest = xml::parse(&system::read_file(&manifest)?)?;
+            (inputs, android_sdk(args)?, merged_manifest)
+        } else {
+            let build = AndroidBuild::prepare(inputs, args)?;
+            let source_manifest = build.main_dir.join("AndroidManifest.xml");
+
+            if !source_manifest.is_file() {
+                return Err(format!("{} is missing", source_manifest.display()));
+            }
+
+            let merged_manifest = Apk {
+                settings: &settings,
+                source_manifest: Some(&source_manifest),
+                test_manifest: None,
+                manifest: &manifest,
+                output: &apk,
+            }
+            .build(&build)?;
+
+            build.inputs.finish(&fingerprint, &apk)?;
+            (build.inputs, build.sdk, merged_manifest)
+        };
+
+    let launch = app_launch(
+        &sdk,
+        settings.application_id.clone(),
+        &merged_manifest,
+        &namespace,
+        args.get("min_sdk")?,
+    );
+
+    // the app's classes, its R and BuildConfig, its Java resources
+    let intermediates = build_dir.join("intermediates");
+    let classes = [
+        "classes/kotlin",
+        "classes/generated",
+        "java-resources-module",
+    ]
+    .map(|dir| intermediates.join(dir));
+
+    let tests = android_tests(context, args, &inputs, &sdk, classes.to_vec(), &settings);
+
+    return Ok(Value::Module(inputs.built_module(
+        None,
+        None,
+        apk,
+        Some(launch),
+        tests,
+    )));
+}
+
+/// build/libs/<name>.jar. Apps using it compile its resources and generate
+/// its R class, like for an aar.
+fn build_android_library(context: &BuildScriptContext, args: &Args) -> Result<Value, String> {
+    let inputs = read_android_inputs(context, args)?;
+    let namespace: String = args.get("namespace")?;
+
+    let source_manifest = Some(inputs.directory.join("src/main/AndroidManifest.xml"))
+        .filter(|manifest| manifest.is_file());
+
+    let jar = inputs
+        .directory
+        .join("build/libs")
+        .join(format!("{}.jar", inputs.name));
+
+    let android = AndroidResources {
+        namespace: namespace.clone(),
+        res_dirs: existing_dirs(&inputs, args, "res_dirs")?,
+        manifest: source_manifest.clone(),
+        symbols: Some(library_symbol_file(&inputs)),
+        asset_dirs: existing_dirs(&inputs, args, "asset_dirs")?,
+        native_library_dirs: native_library_dirs(&inputs, args)?,
+        view_binding: args.get("view_binding")?,
+    };
+
+    let fingerprint =
+        inputs.input_fingerprint(&inputs.name, args, &android_input_paths(&inputs, args)?)?;
+
+    let (inputs, sdk) = if inputs.is_up_to_date(&fingerprint, &[&jar])? {
+        // only the tests need the SDK then
+        let sdk = if context.tests.includes(&inputs.name) {
+            Some(android_sdk(args)?)
+        } else {
+            None
+        };
+        (inputs, sdk)
+    } else {
+        let build = AndroidBuild::prepare(inputs, args)?;
+        let intermediates = build.build_dir.join("intermediates");
+        let manifest = intermediates.join("manifest/AndroidManifest.xml");
+        build.write_manifest(
+            source_manifest.as_deref(),
+            None,
+            &build.namespace,
+            false,
+            &manifest,
+        )?;
+
+        // R with non-final ids only to compile against, apps generate the real one
+        build.inputs.log("Linking resources");
+        let own_resources = build.compile_own_resources()?;
+        let symbols = library_symbol_file(&build.inputs);
+        build.link_library(&manifest, &own_resources, &intermediates, &symbols)?;
+        let r_classes = intermediates.join("classes/r");
+        build.compile_generated_java(
+            &build.write_r_classes(&symbols, None, &intermediates.join("generated/r"))?,
+            &[],
+            &r_classes,
+        )?;
+
+        let build_config = build
+            .write_build_config(&[format!("String LIBRARY_PACKAGE_NAME {}", build.namespace)])?;
+
+        let build_config_classes = intermediates.join("classes/buildconfig");
+        build.compile_generated_java(&[build_config], &[], &build_config_classes)?;
+
+        let classes = intermediates.join("classes/kotlin");
+
+        let generated_resources =
+            build.compile_sources(&[r_classes, build_config_classes.clone()], &classes)?;
+
+        build.build_native_libraries()?;
+
+        // BuildConfig, view bindings and Java resources belong to the library jar, R does not
+        let module_resources = intermediates.join("java-resources-module");
+        build
+            .inputs
+            .resources
+            .process(&generated_resources, &module_resources)?;
+        system::copy_dir_contents(&build_config_classes, &classes)?;
+        system::copy_dir_contents(&module_resources, &classes)?;
+        build.jar(&classes, &jar)?;
+
+        build.inputs.finish(&fingerprint, &jar)?;
+        (build.inputs, Some(build.sdk))
+    };
+
+    let tests = match &sdk {
+        Some(sdk) => {
+            let classes = vec![
+                jar.clone(),
+                inputs.directory.join("build/intermediates/classes/r"),
+            ];
+            android_tests(
+                context,
+                args,
+                &inputs,
+                sdk,
+                classes,
+                &ApkSettings::of_library_tests(&namespace),
+            )
+        }
+        None => vec![],
+    };
+
+    return Ok(Value::Module(inputs.built_module(
+        Some(jar.clone()),
+        Some(android),
+        jar,
+        None,
+        tests,
+    )));
+}
+
+/// What an apk is built as besides the module: the app, or a library's instrumented tests
+struct ApkSettings {
+    application_id: String,
+    version_code: i64,
+    version_name: String,
+    target_sdk: Option<i64>,
+    core_library_desugaring: Option<String>,
+    /// asset name of a JSON report of the libraries' licenses
+    license_report: Option<String>,
+    /// "Type NAME value" of its BuildConfig besides DEBUG and BUILD_TYPE
+    build_config: Vec<String>,
+}
+
+/// One apk of a module: what it is built as, from which manifests, to where
+struct Apk<'a> {
+    settings: &'a ApkSettings,
+    /// src/main/AndroidManifest.xml, apps have one
+    source_manifest: Option<&'a Path>,
+    /// the <instrumentation> and src/androidTest/AndroidManifest.xml, over the module's manifest
+    test_manifest: Option<&'a XmlElement>,
+    /// the merged manifest
+    manifest: &'a Path,
+    output: &'a Path,
+}
+
+impl ApkSettings {
+    fn of_app(args: &Args) -> Result<Self, String> {
+        let namespace: String = args.get("namespace")?;
+
+        let application_id = args
+            .get::<Option<String>>("application_id")?
+            .unwrap_or(namespace);
+
+        let version_code: i64 = args.get("version_code")?;
+        let version_name: String = args.get("version_name")?;
+
+        return Ok(ApkSettings {
+            build_config: vec![
+                format!("String APPLICATION_ID {application_id}"),
+                format!("int VERSION_CODE {version_code}"),
+                format!("String VERSION_NAME {version_name}"),
+            ],
+            application_id,
+            version_code,
+            version_name,
+            target_sdk: args.get("target_sdk")?,
+            core_library_desugaring: args.get("core_library_desugaring")?,
+            license_report: args.get("license_report")?,
+        });
+    }
+
+    /// Like the Gradle plugin, the instrumented tests of a library run in an app of their own
+    fn of_library_tests(namespace: &str) -> Self {
+        return ApkSettings {
+            application_id: format!("{namespace}.test"),
+            version_code: 1,
+            version_name: "1.0".to_string(),
+            target_sdk: None,
+            core_library_desugaring: None,
+            license_report: None,
+            build_config: vec![format!("String LIBRARY_PACKAGE_NAME {namespace}")],
+        };
+    }
+}
+
+impl Apk<'_> {
+    /// Resources linked with aapt2, R and BuildConfig, Kotlin and Java, dex with d8,
+    /// packaged with the Java resources and native libraries. Returns the merged manifest.
+    fn build(&self, build: &AndroidBuild) -> Result<XmlElement, String> {
+        let settings = self.settings;
+        let target_sdk = settings.target_sdk.unwrap_or(build.compile_sdk);
+        let intermediates = build.build_dir.join("intermediates");
+
+        let merged_manifest = build.write_manifest(
+            self.source_manifest,
+            self.test_manifest,
+            &settings.application_id,
+            true,
+            self.manifest,
+        )?;
+
+        build.inputs.log("Linking resources");
+        let own_resources = build.compile_own_resources()?;
+        let symbols = intermediates.join("R.txt");
+        let linked = intermediates.join("apk/resources.ap_");
+
+        let mut extra = vec![
+            // debug builds are debuggable, like with the Gradle plugin
+            "--debug-mode".to_string(),
+            "--target-sdk-version".to_string(),
+            target_sdk.to_string(),
+            "--version-code".to_string(),
+            settings.version_code.to_string(),
+            "--version-name".to_string(),
+            settings.version_name.clone(),
+        ];
+
+        if settings.application_id != build.namespace {
+            extra.extend([
+                "--rename-manifest-package".to_string(),
+                settings.application_id.clone(),
+            ]);
+        }
+
+        let mut asset_dirs = build.merged_asset_dirs();
+
+        if let Some(name) = &settings.license_report {
+            // like the Gradle license plugin with copyJsonReportToAssets
+            let generated = intermediates.join("generated/assets");
+            system::write_file(
+                &generated.join(name),
+                &build.inputs.license_report(TargetPlatform::Android)?,
+            )?;
+            asset_dirs.push(generated);
+        }
+
+        for assets in asset_dirs {
+            extra.extend(["-A".to_string(), assets.display().to_string()]);
+        }
+
+        build.link(self.manifest, &own_resources, &linked, &symbols, &extra)?;
+
+        // the app generates the final R classes of all libraries
+        let mut generated_sources = build.write_r_classes(
+            &symbols,
+            Some(&SymbolTable::read(&symbols)?),
+            &intermediates.join("generated/r"),
+        )?;
+
+        generated_sources.push(build.write_build_config(&settings.build_config)?);
+        let generated = intermediates.join("classes/generated");
+        build.compile_generated_java(
+            &generated_sources,
+            &build.android_classpath(&[]),
+            &generated,
+        )?;
+
+        let classes = intermediates.join("classes/kotlin");
+        let generated_resources = build.compile_sources(&[generated.clone()], &classes)?;
+        build.build_native_libraries()?;
+
+        build.inputs.log("Dexing");
+
+        let own_jars = vec![
+            build.jar(&classes, &intermediates.join("jars/classes.jar"))?,
+            build.jar(&generated, &intermediates.join("jars/generated.jar"))?,
+        ];
+
+        let dex_dir = intermediates.join("dex");
+
+        let desugared = match &settings.core_library_desugaring {
+            Some(version) => {
+                Some(build.desugared_library(version, &intermediates.join("desugar"))?)
+            }
+            None => None,
+        };
+
+        build.dex(&own_jars, &dex_dir, desugared.as_ref())?;
+
+        if let Some(desugared) = &desugared {
+            build.dex_desugared_library(desugared, &dex_dir, &intermediates.join("desugar/dex"))?;
+        }
+
+        build.inputs.log("Packaging");
+        // the app's own Java resources come first, the first jar wins
+        let module_resources = intermediates.join("java-resources-module");
+        build
+            .inputs
+            .resources
+            .process(&generated_resources, &module_resources)?;
+
+        let mut resource_jars =
+            vec![build.jar(&module_resources, &intermediates.join("jars/resources.jar"))?];
+
+        resource_jars.extend(own_jars.iter().chain(&build.jars).cloned());
+        let java_resources = intermediates.join("java-resources");
+        merge_java_resources(
+            &resource_jars,
+            &java_resources,
+            &intermediates.join("java-resources.tmp"),
+        )?;
+        let native_libraries = intermediates.join("native-libraries");
+        build.merge_native_libraries(&native_libraries)?;
+        build.package(
+            &linked,
+            &dex_dir,
+            &java_resources,
+            &native_libraries,
+            &intermediates.join("apk"),
+            self.output,
+        )?;
+
+        return Ok(merged_manifest);
+    }
+}
+
+/// How `build-script run` starts the app: installed, then its launcher activity
+fn app_launch(
+    sdk: &AndroidSdk,
+    application_id: String,
+    merged_manifest: &XmlElement,
+    namespace: &str,
+    min_sdk: i64,
+) -> JvmLaunch {
+    return JvmLaunch::Apk {
+        sdk_root: sdk.root.clone(),
+        application_id,
+        activity: launcher_activity(merged_manifest, namespace),
+        min_sdk,
+    };
+}
+
+fn android_sdk(args: &Args) -> Result<AndroidSdk, String> {
+    return AndroidSdk::ensure(
+        args.get("compile_sdk")?,
+        &args.get::<String>("build_tools")?,
+        args.get("accept_sdk_license")?,
+    );
+}
+
+/// R.txt of a library module, what apps write its R class from
+fn library_symbol_file(inputs: &ModuleBuildInputs) -> PathBuf {
+    return inputs.directory.join("build/intermediates/R.txt");
+}
