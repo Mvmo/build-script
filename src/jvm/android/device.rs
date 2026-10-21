@@ -23,6 +23,21 @@ const IMAGE_SOURCES: &[(&str, &str)] = &[
 const IMAGES_PER_SOURCE: usize = 3;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Instrumented tests in an apk that instruments itself: installed on a device, run
+/// with `am instrument`, their results written as JUnit XML. Like the Gradle plugin
+/// does it, the apk is uninstalled afterwards.
+#[derive(Debug)]
+pub struct InstrumentedTests {
+    pub apk: PathBuf,
+    pub sdk_root: PathBuf,
+    /// application id of the apk
+    pub package: String,
+    pub runner: String,
+    /// lowest API level an emulator for the tests may have
+    pub min_sdk: i64,
+    pub reports_dir: PathBuf,
+}
+
 /// Installs the apk with adb and starts its launcher activity. Without a
 /// connected device the user is guided to an emulator.
 pub fn install_and_start(
@@ -61,6 +76,127 @@ pub fn install_and_start(
     ]);
 
     return system::run(&mut start, "adb shell am start");
+}
+
+impl TestRunner for InstrumentedTests {
+    fn run(&self, module: &str) -> TestOutcome {
+        return self
+            .install_and_instrument(module)
+            .unwrap_or_else(|error| TestOutcome::Failed {
+                counts: None,
+                error,
+            });
+    }
+}
+
+impl InstrumentedTests {
+    fn install_and_instrument(&self, module: &str) -> Result<TestOutcome, String> {
+        let adb = AndroidSdk::adb(&self.sdk_root)?;
+        let device = target_device(&adb, &self.sdk_root, self.min_sdk)?;
+        system::recreate_dir(&self.reports_dir)?;
+        system::log(
+            module,
+            &format!("Installing {} on {device}", self.apk.display()),
+        );
+        let mut install = Command::new(&adb);
+        install
+            .args(["-s", &device, "install", "-r", "-t"])
+            .arg(&self.apk);
+        run_quietly(&mut install, "adb install")?;
+
+        system::log(
+            module,
+            &format!(
+                "Running instrumented tests with {} on {device}",
+                self.runner
+            ),
+        );
+        let instrumentation =
+            instrument(&adb, &device, &format!("{}/{}", self.package, self.runner));
+
+        let mut uninstall = Command::new(&adb);
+        uninstall.args(["-s", &device, "uninstall", &self.package]);
+        let uninstalled = run_quietly(&mut uninstall, "adb uninstall");
+        let instrumentation = instrumentation?;
+        uninstalled?;
+
+        let report = instrumentation.junit_report(&format!("{module} on {device}"));
+        system::write_file(
+            &self.reports_dir.join(format!("TEST-{}.xml", self.package)),
+            &xml::write(&report, &|_| false),
+        )?;
+        let counts = TestCounts::read_junit_reports(&self.reports_dir);
+
+        if let Some(error) = instrumentation.problem() {
+            return Ok(TestOutcome::Failed { counts, error });
+        }
+
+        return Ok(TestOutcome::Passed(counts));
+    }
+}
+
+/// `am instrument -r` with its results read while the tests run, each test shown once it finished
+fn instrument(adb: &Path, device: &str, component: &str) -> Result<Instrumentation, String> {
+    let mut child = Command::new(adb)
+        .args([
+            "-s",
+            device,
+            "shell",
+            "am",
+            "instrument",
+            "-w",
+            "-r",
+            component,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not start {}: {error}", adb.display()))?;
+
+    let mut instrumentation = Instrumentation::default();
+    let stdout = child.stdout.take().expect("stdout is piped");
+
+    for line in BufReader::new(stdout).lines() {
+        let line = line.map_err(|error| format!("could not read from adb: {error}"))?;
+        if let Some(test) = instrumentation.read_line(line.trim_end_matches('\r')) {
+            println!("  {}", test.describe());
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("adb failed: {error}"))?;
+
+    if !status.success() && instrumentation.code.is_none() {
+        return Err(format!("am instrument failed ({status})"));
+    }
+
+    return Ok(instrumentation);
+}
+
+/// What the command prints only shows when it fails
+fn run_quietly(command: &mut Command, what: &str) -> Result<(), String> {
+    let output = command.stdin(Stdio::null()).output().map_err(|error| {
+        format!(
+            "could not start {}: {error}",
+            command.get_program().to_string_lossy()
+        )
+    })?;
+
+    if !output.status.success() {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Err(format!(
+            "{what} failed ({}): {}",
+            output.status,
+            text.trim()
+        ));
+    }
+
+    return Ok(());
 }
 
 /// The device adb works with: the one ANDROID_SERIAL names, the only one connected,
@@ -527,6 +663,207 @@ fn host_abi() -> &'static str {
     }
 }
 
+/// What `am instrument -r` reports, read line by line: a block of
+/// INSTRUMENTATION_STATUS lines per test event, ended by its status code, then
+/// INSTRUMENTATION_RESULT lines and the code of the whole run. Values like stack
+/// traces go on over lines of their own.
+#[derive(Debug, Default)]
+struct Instrumentation {
+    tests: Vec<InstrumentedTest>,
+    /// INSTRUMENTATION_RESULT values, shortMsg says why the tests did not finish
+    result: Vec<(String, String)>,
+    /// INSTRUMENTATION_FAILED, the runner did not start
+    failed: Option<String>,
+    code: Option<i64>,
+    /// of the status block being read
+    status: Vec<(String, String)>,
+    reading_result: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct InstrumentedTest {
+    class: String,
+    name: String,
+    outcome: InstrumentedOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum InstrumentedOutcome {
+    Passed,
+    /// with the stack trace
+    Failed(String),
+    /// ignored, or an assumption did not hold
+    Skipped,
+}
+
+impl Instrumentation {
+    /// Returns the test that just finished
+    fn read_line(&mut self, line: &str) -> Option<&InstrumentedTest> {
+        let value_of = |pair: &str| match pair.split_once('=') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            None => (pair.to_string(), String::new()),
+        };
+
+        if let Some(pair) = line.strip_prefix("INSTRUMENTATION_STATUS: ") {
+            self.status.push(value_of(pair));
+            self.reading_result = false;
+        } else if let Some(code) = line.strip_prefix("INSTRUMENTATION_STATUS_CODE: ") {
+            let status = std::mem::take(&mut self.status);
+            let value = |key: &str| {
+                status
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default()
+            };
+
+            let outcome = match code.trim() {
+                "0" => InstrumentedOutcome::Passed,
+                // -2 a failed assertion, -1 an exception
+                "-1" | "-2" => InstrumentedOutcome::Failed(value("stack")),
+                "-3" | "-4" => InstrumentedOutcome::Skipped,
+                // 1: the test started
+                _ => return None,
+            };
+
+            self.tests.push(InstrumentedTest {
+                class: value("class"),
+                name: value("test"),
+                outcome,
+            });
+
+            return self.tests.last();
+        } else if let Some(pair) = line.strip_prefix("INSTRUMENTATION_RESULT: ") {
+            self.result.push(value_of(pair));
+            self.reading_result = true;
+        } else if let Some(code) = line.strip_prefix("INSTRUMENTATION_CODE: ") {
+            self.code = code.trim().parse().ok();
+        } else if let Some(message) = line.strip_prefix("INSTRUMENTATION_FAILED: ") {
+            self.failed = Some(message.to_string());
+        } else {
+            let last = if self.reading_result {
+                self.result.last_mut()
+            } else {
+                self.status.last_mut()
+            };
+
+            if let Some((_, value)) = last {
+                value.push('\n');
+                value.push_str(line);
+            }
+        }
+
+        return None;
+    }
+
+    /// Why the run failed, None if every test passed
+    fn problem(&self) -> Option<String> {
+        if let Some(failed) = &self.failed {
+            return Some(format!("the instrumentation did not start: {failed}"));
+        }
+
+        if let Some((_, message)) = self.result.iter().find(|(key, _)| key == "shortMsg") {
+            return Some(format!("the tests did not finish: {}", message.trim()));
+        }
+
+        if self.code.is_none() {
+            return Some("the instrumentation ended without a result".to_string());
+        }
+
+        let failed = self
+            .tests
+            .iter()
+            .filter(|test| matches!(test.outcome, InstrumentedOutcome::Failed(_)))
+            .count();
+
+        if failed > 0 {
+            return Some(format!("{failed} instrumented test(s) failed"));
+        }
+
+        return None;
+    }
+
+    /// One <testsuite> like the JUnit Platform writes them
+    fn junit_report(&self, name: &str) -> XmlElement {
+        let count = |wanted: fn(&InstrumentedOutcome) -> bool| {
+            self.tests
+                .iter()
+                .filter(|test| wanted(&test.outcome))
+                .count()
+                .to_string()
+        };
+
+        let mut suite = XmlElement {
+            name: "testsuite".to_string(),
+            attributes: vec![
+                ("name".to_string(), name.to_string()),
+                ("tests".to_string(), self.tests.len().to_string()),
+                (
+                    "failures".to_string(),
+                    count(|outcome| matches!(outcome, InstrumentedOutcome::Failed(_))),
+                ),
+                ("errors".to_string(), "0".to_string()),
+                (
+                    "skipped".to_string(),
+                    count(|outcome| *outcome == InstrumentedOutcome::Skipped),
+                ),
+            ],
+            ..XmlElement::default()
+        };
+
+        for test in &self.tests {
+            let mut case = XmlElement {
+                name: "testcase".to_string(),
+                attributes: vec![
+                    ("classname".to_string(), test.class.clone()),
+                    ("name".to_string(), test.name.clone()),
+                ],
+                ..XmlElement::default()
+            };
+
+            match &test.outcome {
+                InstrumentedOutcome::Passed => {}
+                InstrumentedOutcome::Failed(stack) => case.children.push(XmlElement {
+                    name: "failure".to_string(),
+                    attributes: vec![(
+                        "message".to_string(),
+                        stack.lines().next().unwrap_or_default().to_string(),
+                    )],
+                    text: stack.clone(),
+                    ..XmlElement::default()
+                }),
+                InstrumentedOutcome::Skipped => case.children.push(XmlElement {
+                    name: "skipped".to_string(),
+                    ..XmlElement::default()
+                }),
+            }
+
+            suite.children.push(case);
+        }
+
+        return suite;
+    }
+}
+
+impl InstrumentedTest {
+    /// A line of the test log, failures with the first line of their stack trace
+    fn describe(&self) -> String {
+        let test = format!(
+            "{} > {}",
+            self.class.rsplit('.').next().unwrap_or_default(),
+            self.name
+        );
+
+        match &self.outcome {
+            InstrumentedOutcome::Passed => return format!("✔ {test}"),
+            InstrumentedOutcome::Failed(stack) => {
+                return format!("✘ {test}: {}", stack.lines().next().unwrap_or_default());
+            }
+            InstrumentedOutcome::Skipped => return format!("↷ {test} skipped"),
+        }
+    }
+}
+
 /// A system image the emulator can boot
 #[derive(Debug, Clone, PartialEq)]
 struct SystemImage {
@@ -562,6 +899,104 @@ mod tests {
     use crate::jvm::android::sdk::tests::catalog;
 
     use super::*;
+
+    #[test]
+    fn instrumentation_output_becomes_tests_and_a_report() {
+        let output = "INSTRUMENTATION_STATUS: class=com.example.GreetingTest
+INSTRUMENTATION_STATUS: current=1
+INSTRUMENTATION_STATUS: id=AndroidJUnitRunner
+INSTRUMENTATION_STATUS: numtests=3
+INSTRUMENTATION_STATUS: stream=
+com.example.GreetingTest:
+INSTRUMENTATION_STATUS: test=greets
+INSTRUMENTATION_STATUS_CODE: 1
+INSTRUMENTATION_STATUS: class=com.example.GreetingTest
+INSTRUMENTATION_STATUS: stream=.
+INSTRUMENTATION_STATUS: test=greets
+INSTRUMENTATION_STATUS_CODE: 0
+INSTRUMENTATION_STATUS: class=com.example.GreetingTest
+INSTRUMENTATION_STATUS: test=fails
+INSTRUMENTATION_STATUS_CODE: 1
+INSTRUMENTATION_STATUS: class=com.example.GreetingTest
+INSTRUMENTATION_STATUS: stack=java.lang.AssertionError: expected:<Hi> but was:<Hello>
+\tat org.junit.Assert.fail(Assert.java:89)
+INSTRUMENTATION_STATUS: stream=
+Error in fails(com.example.GreetingTest):
+INSTRUMENTATION_STATUS: test=fails
+INSTRUMENTATION_STATUS_CODE: -2
+INSTRUMENTATION_STATUS: class=com.example.GreetingTest
+INSTRUMENTATION_STATUS: test=later
+INSTRUMENTATION_STATUS_CODE: -3
+INSTRUMENTATION_RESULT: stream=
+
+Time: 0.05
+FAILURES!!!
+Tests run: 2,  Failures: 1
+
+INSTRUMENTATION_CODE: -1";
+
+        let mut instrumentation = Instrumentation::default();
+
+        let finished: Vec<String> = output
+            .lines()
+            .filter_map(|line| {
+                instrumentation
+                    .read_line(line)
+                    .map(InstrumentedTest::describe)
+            })
+            .collect();
+
+        assert_eq!(
+            finished,
+            [
+                "✔ GreetingTest > greets",
+                "✘ GreetingTest > fails: java.lang.AssertionError: expected:<Hi> but was:<Hello>",
+                "↷ GreetingTest > later skipped",
+            ]
+        );
+        assert_eq!(
+            instrumentation.problem().as_deref(),
+            Some("1 instrumented test(s) failed")
+        );
+
+        let report = instrumentation.junit_report("app");
+        assert_eq!(report.attribute("tests"), Some("3"));
+        assert_eq!(report.attribute("failures"), Some("1"));
+        assert_eq!(report.attribute("skipped"), Some("1"));
+        let failure = report.children[1].child("failure").unwrap();
+        assert!(
+            failure
+                .text
+                .ends_with("\tat org.junit.Assert.fail(Assert.java:89)"),
+            "{}",
+            failure.text
+        );
+
+        // a crash ends the run without a test failing
+        let mut crashed = Instrumentation::default();
+
+        for line in [
+            "INSTRUMENTATION_RESULT: shortMsg=Process crashed.",
+            "INSTRUMENTATION_CODE: 0",
+        ] {
+            crashed.read_line(line);
+        }
+
+        assert_eq!(
+            crashed.problem().as_deref(),
+            Some("the tests did not finish: Process crashed.")
+        );
+        let mut not_started = Instrumentation::default();
+        not_started.read_line(
+            "INSTRUMENTATION_FAILED: com.example.test/androidx.test.runner.AndroidJUnitRunner",
+        );
+        assert!(
+            not_started
+                .problem()
+                .unwrap()
+                .starts_with("the instrumentation did not start")
+        );
+    }
 
     fn image_package(path: &str, channel: &str, api: &str, size: &str) -> String {
         return format!(

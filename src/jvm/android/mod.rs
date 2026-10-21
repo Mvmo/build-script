@@ -35,6 +35,11 @@ pub use device::install_and_start;
 pub const DEFAULT_COMPILE_SDK: i64 = 36;
 pub const DEFAULT_MIN_SDK: i64 = 24;
 pub const DEFAULT_BUILD_TOOLS: &str = "36.1.0";
+/// what new Android Studio projects run their instrumented tests with
+const DEFAULT_TEST_RUNNER: &str = "androidx.test.runner.AndroidJUnitRunner";
+/// added to the instrumented tests when they use the default runner without naming it
+const DEFAULT_TEST_RUNNER_LIBRARY: &str = "androidx.test:runner:1.6.2";
+
 /// What consumers of an Android library need besides its classes
 #[derive(Debug, Hash)]
 pub struct AndroidResources {
@@ -554,6 +559,182 @@ fn android_sdk(args: &Args) -> Result<AndroidSdk, String> {
         &args.get::<String>("build_tools")?,
         args.get("accept_sdk_license")?,
     );
+}
+
+/// The unit tests of src/test on the JUnit Platform, and the instrumented tests of
+/// src/androidTest in an apk, which runs on a device once the script is built
+fn android_tests(
+    context: &BuildScriptContext,
+    args: &Args,
+    inputs: &ModuleBuildInputs,
+    sdk: &AndroidSdk,
+    classes: Vec<PathBuf>,
+    settings: &ApkSettings,
+) -> Vec<TestSuite> {
+    if !context.tests.includes(&inputs.name) {
+        return vec![];
+    }
+
+    let unit_tests = UnitTests {
+        inputs,
+        args,
+        classes,
+        platform: TargetPlatform::Android,
+        android_jar: Some(sdk.android_jar.clone()),
+    };
+
+    let instrumented = instrumented_tests(context, args, sdk, settings).unwrap_or_else(|error| {
+        ModuleTests::Known(TestOutcome::Failed {
+            counts: None,
+            error,
+        })
+    });
+
+    return vec![
+        unit_tests.prepare(),
+        TestSuite {
+            source_set: "androidTest",
+            tests: instrumented,
+        },
+    ];
+}
+
+/// Like the Gradle plugin does for libraries, the module and its instrumented tests
+/// are one apk that instruments itself. For an app it keeps the application id, so
+/// it takes the place of the app on the device while the tests run.
+fn instrumented_tests(
+    context: &BuildScriptContext,
+    args: &Args,
+    sdk: &AndroidSdk,
+    settings: &ApkSettings,
+) -> Result<ModuleTests, String> {
+    let mut inputs = read_android_inputs(context, args)?;
+
+    let test_source_dirs: Vec<PathBuf> = args
+        .get::<Vec<String>>("android_test_source_dirs")?
+        .iter()
+        .map(|dir| inputs.directory.join(dir))
+        .collect();
+
+    let (kotlin_tests, java_tests) = kotlin_and_java_sources(&test_source_dirs);
+
+    if kotlin_tests.is_empty() && java_tests.is_empty() {
+        return Ok(ModuleTests::Known(TestOutcome::NoTests));
+    }
+
+    let runner: String = args.get("test_instrumentation_runner")?;
+
+    let mut test_dependencies =
+        Dependencies::read(args, "android_test_dependencies", &inputs.kotlin_version)?;
+
+    let names_runner = test_dependencies
+        .libraries
+        .iter()
+        .any(|library| library.group == "androidx.test" && library.artifact == "runner");
+
+    if runner == DEFAULT_TEST_RUNNER && !names_runner {
+        test_dependencies
+            .libraries
+            .extend(MavenCoordinate::parse(DEFAULT_TEST_RUNNER_LIBRARY));
+    }
+
+    inputs.source_dirs.extend(test_source_dirs);
+    inputs
+        .dependencies
+        .libraries
+        .extend(test_dependencies.libraries);
+    inputs
+        .dependencies
+        .platforms
+        .extend(test_dependencies.platforms);
+    inputs
+        .dependencies
+        .modules
+        .extend(test_dependencies.modules);
+
+    // where the Gradle plugin puts them
+    let manifest = inputs
+        .directory
+        .join("build/androidTest/intermediates/manifest/AndroidManifest.xml");
+
+    let apk = inputs.directory.join(format!(
+        "build/outputs/apk/androidTest/debug/{}-debug-androidTest.apk",
+        inputs.name
+    ));
+
+    let reports_dir = inputs
+        .directory
+        .join("build/outputs/androidTest-results/connected");
+
+    let mut input_paths = android_input_paths(&inputs, args)?;
+    input_paths.push(inputs.directory.join("src/androidTest"));
+
+    let fingerprint =
+        inputs.input_fingerprint(&format!("{}-androidTest", inputs.name), args, &input_paths)?;
+
+    // the apk may be up to date, the tests run anyway: their device is an input too
+    if fingerprint.is_up_to_date(&[&apk])? {
+        inputs.log("Apk of the instrumented tests up to date");
+    } else {
+        let build = AndroidBuild::prepare_android_tests(inputs, args)?;
+
+        let source_manifest =
+            Some(build.main_dir.join("AndroidManifest.xml")).filter(|manifest| manifest.is_file());
+
+        let test_manifest = test_manifest(&build.inputs.directory, settings, &runner)?;
+        Apk {
+            settings,
+            source_manifest: source_manifest.as_deref(),
+            test_manifest: Some(&test_manifest),
+            manifest: &manifest,
+            output: &apk,
+        }
+        .build(&build)?;
+        build.inputs.finish(&fingerprint, &apk)?;
+    }
+
+    return Ok(ModuleTests::Run(Box::new(InstrumentedTests {
+        apk,
+        sdk_root: sdk.root.clone(),
+        package: settings.application_id.clone(),
+        runner,
+        min_sdk: args.get("min_sdk")?,
+        reports_dir,
+    })));
+}
+
+/// src/androidTest/AndroidManifest.xml with the <instrumentation> of the tests, which instrument their own apk
+fn test_manifest(
+    module_dir: &Path,
+    settings: &ApkSettings,
+    runner: &str,
+) -> Result<XmlElement, String> {
+    let source = module_dir.join("src/androidTest/AndroidManifest.xml");
+    let mut manifest = match source.is_file() {
+        true => read_manifest_with_placeholders(&source, &settings.application_id, &[])?,
+        false => XmlElement {
+            name: "manifest".to_string(),
+            ..XmlElement::default()
+        },
+    };
+
+    manifest.children.push(XmlElement {
+        name: "instrumentation".to_string(),
+        attributes: vec![
+            ("android:name".to_string(), runner.to_string()),
+            (
+                "android:targetPackage".to_string(),
+                settings.application_id.clone(),
+            ),
+            (
+                "android:label".to_string(),
+                format!("Tests for {}", settings.application_id),
+            ),
+        ],
+        ..XmlElement::default()
+    });
+
+    return Ok(manifest);
 }
 
 /// R.txt of a library module, what apps write its R class from
