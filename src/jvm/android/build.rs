@@ -31,6 +31,11 @@ pub const DEFAULT_NDK_VERSION: &str = "28.2.13676358";
 const NATIVE_MULTIDEX_API: i64 = 21;
 /// runtime of generated view bindings, which implement its ViewBinding interface
 const VIEW_BINDING_VERSION: &str = "8.1.0";
+/// the CMake of the SDK the Android Gradle plugin uses by default
+const CMAKE_VERSION: &str = "3.22.1";
+/// what the Android Gradle plugin builds without abiFilters
+const ABIS: &[&str] = &["armeabi-v7a", "arm64-v8a", "x86", "x86_64"];
+
 /// What app and library builds share up to compiling Kotlin
 pub struct AndroidBuild {
     pub inputs: ModuleBuildInputs,
@@ -110,6 +115,20 @@ pub fn existing_dirs(
         .map(|dir| inputs.directory.join(dir))
         .filter(|dir| system::contains_files(dir))
         .collect());
+}
+
+/// The module's jniLibs and, with a CMakeLists.txt, the libraries built from it
+pub fn native_library_dirs(
+    inputs: &ModuleBuildInputs,
+    args: &Args,
+) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = source_set_dirs_with_files(inputs, "jniLibs");
+
+    if args.get::<Option<String>>("cmake")?.is_some() {
+        dirs.push(CMakeBuild::libraries_dir(&cmake_dir(inputs)));
+    }
+
+    return Ok(dirs);
 }
 
 /// What the outputs of an Android module depend on besides the sources:
@@ -540,6 +559,46 @@ impl AndroidBuild {
         );
 
         return dirs;
+    }
+
+    /// From the module's CMakeLists.txt, if it has one
+    pub fn build_native_libraries(&self) -> Result<(), String> {
+        let Some(cmake_lists) = &self.cmake_lists else {
+            return Ok(());
+        };
+        return CMakeBuild {
+            cmake_lists,
+            sdk_root: &self.sdk.root,
+            ndk_version: &self.ndk_version,
+            min_sdk: self.min_sdk,
+            work_dir: cmake_dir(&self.inputs),
+            accept_license: self.accept_license,
+        }
+        .run(&|message| self.inputs.log(message));
+    }
+
+    /// Those of the libraries and of the module to `output`/lib/<abi>, the module's win
+    pub fn merge_native_libraries(&self, output: &Path) -> Result<(), String> {
+        system::remove_dir(output)?;
+
+        let mut dirs: Vec<PathBuf> = self
+            .libraries
+            .iter()
+            .flat_map(|library| library.native_library_dirs.iter().cloned())
+            .collect();
+
+        dirs.extend(self.native_library_dirs.iter().cloned());
+        for dir in dirs {
+            for library in system::files_with_extension(&[dir.clone()], "so") {
+                let relative = library
+                    .strip_prefix(&dir)
+                    .map_err(|error| error.to_string())?;
+
+                system::copy_file(&library, &output.join("lib").join(relative))?;
+            }
+        }
+
+        return Ok(());
     }
 
     /// R and BuildConfig
@@ -1327,6 +1386,94 @@ impl UnpackedLibraries {
     }
 }
 
+/// The shared libraries of one CMakeLists.txt, like externalNativeBuild in the Android Gradle plugin
+struct CMakeBuild<'a> {
+    cmake_lists: &'a Path,
+    sdk_root: &'a Path,
+    ndk_version: &'a str,
+    min_sdk: i64,
+    /// build/intermediates/cmake: the CMake builds and the libraries in libs/<abi>
+    work_dir: PathBuf,
+    accept_license: bool,
+}
+
+impl CMakeBuild<'_> {
+    /// One directory per ABI like jniLibs
+    fn libraries_dir(work_dir: &Path) -> PathBuf {
+        return work_dir.join("libs");
+    }
+
+    /// Installs the NDK and CMake if needed, then configures and builds the
+    /// libraries for every ABI, a debug build like the Gradle plugin's
+    fn run(&self, log: &dyn Fn(&str)) -> Result<(), String> {
+        let ndk = self.sdk_root.join("ndk").join(self.ndk_version);
+        let cmake_home = self.sdk_root.join("cmake").join(CMAKE_VERSION);
+
+        let packages = [
+            (format!("ndk;{}", self.ndk_version), &ndk),
+            (format!("cmake;{CMAKE_VERSION}"), &cmake_home),
+        ];
+
+        if packages.iter().any(|(_, dir)| !dir.is_dir()) {
+            let catalog = SdkCatalog::load()?;
+            for (package, dir) in packages.iter().filter(|(_, dir)| !dir.is_dir()) {
+                catalog.install(self.sdk_root, package, dir, self.accept_license)?;
+            }
+        }
+
+        let cmake = cmake_home
+            .join("bin")
+            .join(format!("cmake{}", std::env::consts::EXE_SUFFIX));
+
+        let ninja = cmake_home
+            .join("bin")
+            .join(format!("ninja{}", std::env::consts::EXE_SUFFIX));
+
+        let source_dir = self
+            .cmake_lists
+            .parent()
+            .ok_or_else(|| format!("{} has no directory", self.cmake_lists.display()))?;
+
+        let libraries = Self::libraries_dir(&self.work_dir);
+        system::remove_dir(&libraries)?;
+
+        for abi in ABIS {
+            log(&format!(
+                "Building native libraries for {abi} (CMake, NDK {})",
+                self.ndk_version
+            ));
+            let build_dir = self.work_dir.join("build").join(abi);
+            let mut configure = Command::new(&cmake);
+            configure
+                .arg("-S")
+                .arg(source_dir)
+                .arg("-B")
+                .arg(&build_dir)
+                .args(["-G", "Ninja"])
+                .arg(format!("-DCMAKE_MAKE_PROGRAM={}", ninja.display()))
+                .arg(format!(
+                    "-DCMAKE_TOOLCHAIN_FILE={}",
+                    ndk.join("build/cmake/android.toolchain.cmake").display()
+                ))
+                .arg(format!("-DANDROID_NDK={}", ndk.display()))
+                .arg(format!("-DANDROID_ABI={abi}"))
+                .arg(format!("-DANDROID_PLATFORM=android-{}", self.min_sdk))
+                .arg("-DCMAKE_BUILD_TYPE=Debug")
+                .arg(format!(
+                    "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}",
+                    libraries.join(abi).display()
+                ));
+            system::run(&mut configure, &format!("cmake for {abi}"))?;
+
+            let mut build = Command::new(&cmake);
+            build.arg("--build").arg(&build_dir);
+            system::run(&mut build, &format!("native build for {abi}"))?;
+        }
+
+        return Ok(());
+    }
+}
+
 /// aapt2 compile of a res directory into a zip, renamed once complete: compiled resources of aars are cached
 /// aapt2 compile of a res directory into <name>-<hash of its files>.zip in
 /// `res_cache`, again only when they change: an app compiles those of all its
@@ -1407,6 +1554,10 @@ fn source_set_dirs_with_files(inputs: &ModuleBuildInputs, name: &str) -> Vec<Pat
         .map(|source_set| inputs.directory.join(source_set).join(name))
         .filter(|dir| system::contains_files(dir))
         .collect();
+}
+
+fn cmake_dir(inputs: &ModuleBuildInputs) -> PathBuf {
+    return inputs.directory.join("build/intermediates/cmake");
 }
 
 /// d8 output worth showing, and how many lines of known noise it hid. d8
