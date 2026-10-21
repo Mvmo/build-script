@@ -73,6 +73,12 @@ pub struct AndroidBuild {
     accept_license: bool,
 }
 
+/// desugar_jdk_libs: its d8 configuration and its jars
+pub struct DesugaredLibrary {
+    config: PathBuf,
+    jars: Vec<PathBuf>,
+}
+
 /// Like with the Gradle plugin, view bindings come with their runtime, which
 /// consumers of a library need as well
 pub fn read_android_inputs(
@@ -140,6 +146,58 @@ pub fn android_input_paths(
     }
 
     return Ok(paths);
+}
+
+/// Non-class files of the jars, like the Gradle plugin packages them: the
+/// first jar wins, META-INF/services files are concatenated
+pub fn merge_java_resources(jars: &[PathBuf], output: &Path, scratch: &Path) -> Result<(), String> {
+    system::recreate_dir(output)?;
+    // jars of the cache never change, like those of Maven and of aars: their resources are extracted once
+    let cache = system::cache_dir("");
+    for jar in unique(jars) {
+        let resources = if jar.starts_with(&cache) {
+            system::kept_in_cache("java-resources", &jar, |target| {
+                extract_java_resources(&jar, target)
+            })?
+        } else {
+            extract_java_resources(&jar, scratch)?;
+            scratch.to_path_buf()
+        };
+
+        for path in system::files_below(&[resources.clone()]) {
+            let relative = path
+                .strip_prefix(&resources)
+                .map_err(|error| error.to_string())?;
+
+            let target = output.join(relative);
+
+            let is_service = relative.starts_with("META-INF/services");
+            if target.exists() && !is_service {
+                continue;
+            }
+
+            let mut content = fs::read(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+
+            if target.exists() {
+                let mut existing = fs::read(&target)
+                    .map_err(|error| format!("could not read {}: {error}", target.display()))?;
+
+                if !existing.ends_with(b"\n") {
+                    existing.push(b'\n');
+                }
+
+                existing.extend(content);
+                content = existing;
+            }
+
+            system::create_parent_dir(&target)?;
+            fs::write(&target, content)
+                .map_err(|error| format!("could not write {}: {error}", target.display()))?;
+        }
+    }
+
+    return system::remove_dir(scratch);
 }
 
 impl AndroidBuild {
@@ -541,6 +599,360 @@ impl AndroidBuild {
         return Ok(jar.to_path_buf());
     }
 
+    /// desugar_jdk_libs and its d8 configuration, like isCoreLibraryDesugaringEnabled
+    pub fn desugared_library(
+        &self,
+        version: &str,
+        work_dir: &Path,
+    ) -> Result<DesugaredLibrary, String> {
+        let mut resolver =
+            DependencyResolver::new(self.inputs.repositories.clone(), TargetPlatform::Jvm);
+
+        let jars = resolver.resolve_with_platforms(
+            &[MavenCoordinate::new(
+                "com.android.tools",
+                "desugar_jdk_libs",
+                version,
+            )],
+            &[],
+        )?;
+
+        let configuration_jar = jars
+            .iter()
+            .find(|jar| {
+                jar.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("desugar_jdk_libs_configuration")
+                })
+            })
+            .ok_or("desugar_jdk_libs came without its configuration")?;
+
+        let configuration =
+            system::read_zip_entry(configuration_jar, "META-INF/desugar/d8/desugar.json")?;
+
+        let config = work_dir.join("desugar.json");
+        system::write_file(&config, &String::from_utf8_lossy(&configuration))?;
+
+        return Ok(DesugaredLibrary { config, jars });
+    }
+
+    /// With L8, added after the app's dex files. Kept in `work_dir` until the
+    /// library or how it is dexed changes, it is the same for every build.
+    pub fn dex_desugared_library(
+        &self,
+        library: &DesugaredLibrary,
+        dex_dir: &Path,
+        work_dir: &Path,
+    ) -> Result<(), String> {
+        let mut hasher = DefaultHasher::new();
+        (
+            &self.sdk.d8,
+            &self.sdk.android_jar,
+            self.min_api(),
+            up_to_date::files_hash(&library.jars)?,
+            system::read_file(&library.config)?,
+        )
+            .hash(&mut hasher);
+        let dexed = work_dir.join(format!("{:016x}", hasher.finish()));
+
+        if !dexed.is_dir() {
+            system::recreate_dir(work_dir)?;
+            let partial = work_dir.join("partial");
+
+            let mut command = self
+                .inputs
+                .jdk
+                .java_main(&[self.sdk.d8.clone()], "com.android.tools.r8.L8")?;
+
+            command
+                .arg("--debug")
+                .arg("--min-api")
+                .arg(self.min_api().to_string())
+                .arg("--lib")
+                .arg(&self.sdk.android_jar)
+                .arg("--desugared-lib")
+                .arg(&library.config)
+                .arg("--output")
+                .arg(&partial)
+                .args(&library.jars);
+            system::create_dir(&partial)?;
+            system::run(&mut command, "L8")?;
+            fs::rename(&partial, &dexed)
+                .map_err(|error| format!("could not move {}: {error}", partial.display()))?;
+        }
+
+        let mut next = system::files_with_extension(&[dex_dir.to_path_buf()], "dex").len() + 1;
+        for dex in dex_files(&dexed) {
+            system::copy_file(&dex, &dex_dir.join(format!("classes{next}.dex")))?;
+            next += 1;
+        }
+
+        return Ok(());
+    }
+
+    /// The own classes and those of the library modules on every build, the other
+    /// libraries once: like the Gradle plugin dexes them ahead, their dex files are
+    /// kept until one of them changes. Native multidex loads the dex files of both.
+    pub fn dex(
+        &self,
+        own: &[PathBuf],
+        output: &Path,
+        desugared: Option<&DesugaredLibrary>,
+    ) -> Result<(), String> {
+        // like Android Studio does for debug builds: below API 21 one dex file
+        // would have to hold everything, so dex for native multidex instead
+        if self.min_api() != self.min_sdk {
+            self.inputs.log(&format!(
+                "Note: min_sdk {} is below {NATIVE_MULTIDEX_API}, the debug apk uses native multidex and needs Android 5.0 or newer",
+                self.min_sdk,
+            ));
+        }
+
+        let modules: HashSet<&PathBuf> = self.module_jars.iter().collect();
+        let own = unique(own.iter().chain(&self.module_jars));
+        let libraries = unique(self.jars.iter().filter(|jar| !modules.contains(jar)));
+
+        let libraries_dex = self.dexed_libraries(&libraries, desugared)?;
+        let own_dex = self.build_dir.join("intermediates/dex-own");
+        system::recreate_dir(&own_dex)?;
+        self.run_d8(&own, &libraries, &own_dex, desugared)?;
+
+        // the own classes first, in classes.dex
+        system::recreate_dir(output)?;
+        for (index, dex) in dex_files(&own_dex)
+            .into_iter()
+            .chain(dex_files(&libraries_dex))
+            .enumerate()
+        {
+            let name = if index == 0 {
+                "classes.dex".to_string()
+            } else {
+                format!("classes{}.dex", index + 1)
+            };
+
+            system::copy_file(&dex, &output.join(name))?;
+        }
+
+        return Ok(());
+    }
+
+    /// In intermediates/dex-libraries/<hash of the libraries and of how d8 runs>
+    fn dexed_libraries(
+        &self,
+        libraries: &[PathBuf],
+        desugared: Option<&DesugaredLibrary>,
+    ) -> Result<PathBuf, String> {
+        let mut hasher = DefaultHasher::new();
+        (
+            &self.sdk.d8,
+            &self.sdk.android_jar,
+            self.min_api(),
+            up_to_date::files_hash(libraries)?,
+        )
+            .hash(&mut hasher);
+
+        if let Some(desugared) = desugared {
+            system::read_file(&desugared.config)?.hash(&mut hasher);
+        }
+
+        let dexed = self.build_dir.join("intermediates/dex-libraries");
+        let dex = dexed.join(format!("{:016x}", hasher.finish()));
+
+        if dex.is_dir() {
+            self.inputs.log("Libraries dexed before");
+            return Ok(dex);
+        }
+
+        // only those of the current libraries are kept, renamed once complete
+        system::recreate_dir(&dexed)?;
+        let partial = dexed.join("partial");
+        system::create_dir(&partial)?;
+
+        if !libraries.is_empty() {
+            self.inputs.log(&format!(
+                "Dexing {} libraries, again only when they change",
+                libraries.len()
+            ));
+            self.run_d8(libraries, &[], &partial, desugared)?;
+        }
+
+        fs::rename(&partial, &dex)
+            .map_err(|error| format!("could not move {}: {error}", partial.display()))?;
+
+        return Ok(dex);
+    }
+
+    /// `classpath` only to desugar against, like the libraries for the own classes
+    fn run_d8(
+        &self,
+        inputs: &[PathBuf],
+        classpath: &[PathBuf],
+        output: &Path,
+        desugared: Option<&DesugaredLibrary>,
+    ) -> Result<(), String> {
+        let mut command = self
+            .inputs
+            .jdk
+            .java_main(&[self.sdk.d8.clone()], "com.android.tools.r8.D8")?;
+
+        command
+            .arg("--debug")
+            .arg("--min-api")
+            .arg(self.min_api().to_string())
+            .arg("--lib")
+            .arg(&self.sdk.android_jar)
+            .arg("--output")
+            .arg(output);
+
+        for jar in classpath {
+            command.arg("--classpath").arg(jar);
+        }
+
+        if let Some(desugared) = desugared {
+            command.arg("--desugared-lib").arg(&desugared.config);
+        }
+
+        command.args(inputs);
+
+        let result = command
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("could not start d8: {error}"))?;
+
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+
+        if !result.status.success() {
+            eprint!("{text}");
+            return Err(format!("d8 failed ({})", result.status));
+        }
+
+        let (shown, hidden) = split_d8_noise(&text);
+
+        for line in shown {
+            eprintln!("{line}");
+        }
+
+        if hidden > 0 {
+            self.inputs.log(&format!(
+                "d8: hid {hidden} lines of notes about libraries (Kotlin metadata newer than this d8 knows, stripped debug info)",
+            ));
+        }
+
+        return Ok(());
+    }
+
+    /// Resources, dex, Java resources and native libraries, aligned and signed with the debug key
+    pub fn package(
+        &self,
+        linked: &Path,
+        dex_dir: &Path,
+        java_resources: &Path,
+        native_libraries: &Path,
+        work_dir: &Path,
+        apk: &Path,
+    ) -> Result<(), String> {
+        let unaligned = work_dir.join("unaligned.apk");
+        let aligned = work_dir.join("aligned.apk");
+        system::copy_file(linked, &unaligned)?;
+
+        let mut zip = Command::new("zip");
+        zip.args(["-q", "-j"])
+            .arg(&unaligned)
+            .args(system::files_with_extension(
+                &[dex_dir.to_path_buf()],
+                "dex",
+            ));
+        system::run(&mut zip, "adding dex files")?;
+
+        if system::contains_files(java_resources) {
+            let unaligned = fs::canonicalize(&unaligned).map_err(|error| error.to_string())?;
+            let mut zip = Command::new("zip");
+            zip.args(["-q", "-r"])
+                .arg(&unaligned)
+                .arg(".")
+                .current_dir(java_resources);
+            system::run(&mut zip, "adding java resources")?;
+        }
+
+        // stored and page aligned, so they load from the apk and extractNativeLibs="false" works
+        if system::contains_files(native_libraries) {
+            let unaligned = fs::canonicalize(&unaligned).map_err(|error| error.to_string())?;
+            let mut zip = Command::new("zip");
+            zip.args(["-q", "-r", "-0"])
+                .arg(&unaligned)
+                .arg("lib")
+                .current_dir(native_libraries);
+            system::run(&mut zip, "adding native libraries")?;
+        }
+
+        let _ = fs::remove_file(&aligned);
+        let mut zipalign = Command::new(&self.sdk.zipalign);
+
+        // 16 KB pages like Android 15 devices may have, older zipaligns only know 4 KB
+        match self
+            .sdk
+            .build_tools
+            .split('.')
+            .next()
+            .and_then(|major| major.parse::<u32>().ok())
+        {
+            Some(major) if major >= 35 => zipalign.args(["-P", "16"]),
+            _ => zipalign.arg("-p"),
+        };
+
+        zipalign.args(["-f", "4"]).arg(&unaligned).arg(&aligned);
+        system::run(&mut zipalign, "zipalign")?;
+
+        system::create_parent_dir(apk)?;
+        let keystore = debug_keystore(&self.inputs.jdk)?;
+        let mut sign = Command::new(self.inputs.jdk.tool("java"));
+        sign.arg("-jar")
+            .arg(&self.sdk.apksigner)
+            .arg("sign")
+            .arg("--ks")
+            .arg(&keystore)
+            // the well known password of the debug key every Android tool uses
+            .args([
+                "--ks-pass",
+                "pass:android",
+                "--key-pass",
+                "pass:android",
+                "--ks-key-alias",
+                "androiddebugkey",
+            ])
+            .arg("--min-sdk-version")
+            .arg(self.min_sdk.to_string())
+            .arg("--out")
+            .arg(apk)
+            .arg(&aligned);
+        system::run(&mut sign, "apksigner sign")?;
+
+        // a sanity check, its warnings about META-INF files outside the v2/v3 signature are expected
+        let verify = Command::new(self.inputs.jdk.tool("java"))
+            .arg("-jar")
+            .arg(&self.sdk.apksigner)
+            .arg("verify")
+            .arg(apk)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("could not start apksigner: {error}"))?;
+
+        if !verify.status.success() {
+            eprint!(
+                "{}{}",
+                String::from_utf8_lossy(&verify.stdout),
+                String::from_utf8_lossy(&verify.stderr)
+            );
+            return Err(format!("apksigner verify failed ({})", verify.status));
+        }
+
+        return Ok(());
+    }
+
     fn run_link(
         &self,
         manifest: &Path,
@@ -678,6 +1090,73 @@ impl AndroidBuild {
     fn min_api(&self) -> i64 {
         return self.min_sdk.max(NATIVE_MULTIDEX_API);
     }
+}
+
+/// The non-class files of a jar, without its manifest and signatures
+fn extract_java_resources(jar: &Path, target: &Path) -> Result<(), String> {
+    system::recreate_dir(target)?;
+    let mut unzip = Command::new("unzip");
+    unzip
+        .stdin(Stdio::null())
+        .args(["-q", "-o"])
+        .arg(jar)
+        .args([
+            "-x",
+            "*.class",
+            "META-INF/MANIFEST.MF",
+            "META-INF/*.SF",
+            "META-INF/*.RSA",
+            "META-INF/*.DSA",
+            "META-INF/*.EC",
+            "META-INF/versions/*",
+        ])
+        .arg("-d")
+        .arg(target);
+
+    // exit code 1 = only warnings (an exclude pattern did not match), 11 = nothing left to extract
+    let result = unzip
+        .output()
+        .map_err(|error| format!("could not start unzip: {error}"))?;
+
+    if !matches!(result.status.code(), Some(0 | 1 | 11)) {
+        return Err(format!(
+            "unzip of {} failed ({}): {}",
+            jar.display(),
+            result.status,
+            String::from_utf8_lossy(&result.stderr).trim()
+        ));
+    }
+
+    system::make_accessible(target);
+
+    return Ok(());
+}
+
+/// Each path once, in the order they come
+fn unique<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    return paths
+        .into_iter()
+        .filter(|path| seen.insert(*path))
+        .cloned()
+        .collect();
+}
+
+/// classes.dex, classes2.dex, ... of a d8 output, in that order
+fn dex_files(directory: &Path) -> Vec<PathBuf> {
+    let mut files = system::files_with_extension(&[directory.to_path_buf()], "dex");
+    files.sort_by_key(|file| {
+        let stem = file
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        stem.trim_start_matches("classes")
+            .parse::<usize>()
+            .unwrap_or(1)
+    });
+
+    return files;
 }
 
 /// Resources of an aar or a library module
@@ -928,4 +1407,101 @@ fn source_set_dirs_with_files(inputs: &ModuleBuildInputs, name: &str) -> Vec<Pat
         .map(|source_set| inputs.directory.join(source_set).join(name))
         .filter(|dir| system::contains_files(dir))
         .collect();
+}
+
+/// d8 output worth showing, and how many lines of known noise it hid. d8
+/// warns about every class with Kotlin metadata newer than it knows, which is
+/// harmless for dexing.
+fn split_d8_noise(text: &str) -> (Vec<&str>, usize) {
+    // a diagnostic starts with Warning/Info/Error and ends at the next one or an empty line
+    let mut blocks: Vec<Vec<&str>> = vec![vec![]];
+
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            blocks.push(vec![]);
+            continue;
+        }
+
+        if line.starts_with("Warning") || line.starts_with("Info") || line.starts_with("Error") {
+            blocks.push(vec![]);
+        }
+
+        blocks.last_mut().unwrap().push(line);
+    }
+
+    let mut shown = vec![];
+    let mut hidden = 0;
+
+    for block in blocks.into_iter().filter(|block| !block.is_empty()) {
+        let noise = block[0].starts_with("Info")
+            || block
+                .iter()
+                .any(|line| line.contains("otlin metadata") || line.contains("kotlin.Metadata"));
+
+        if noise {
+            hidden += block.len();
+        } else {
+            shown.extend(block);
+        }
+    }
+
+    return (shown, hidden);
+}
+
+/// Like ~/.android/debug.keystore, created on first use
+fn debug_keystore(jdk: &Jdk) -> Result<PathBuf, String> {
+    let keystore = system::data_dir("android").join("debug.keystore");
+
+    if keystore.is_file() {
+        return Ok(keystore);
+    }
+
+    system::create_parent_dir(&keystore)?;
+    let mut command = Command::new(jdk.tool("keytool"));
+    command
+        .arg("-genkeypair")
+        .arg("-keystore")
+        .arg(&keystore)
+        .args([
+            "-storepass",
+            "android",
+            "-keypass",
+            "android",
+            "-alias",
+            "androiddebugkey",
+        ])
+        .args(["-keyalg", "RSA", "-keysize", "2048", "-validity", "10000"])
+        .args(["-dname", "CN=Android Debug,O=Android,C=US"]);
+    system::run(&mut command, "keytool")?;
+
+    return Ok(keystore);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn d8_noise_is_hidden() {
+        let output = "Warning: An error occurred when parsing kotlin metadata. This normally happens ...
+Warning: Unexpected error during rewriting of Kotlin metadata for class 'kotlin.ranges.UIntProgression':
+com.android.tools.r8.internal.wc4: Should never be called
+
+Info in /x/coroutines.jar:kotlinx/coroutines/A.class:
+Methods with invalid locals information:
+  void a()
+Warning in /x/leakcanary.jar:leakcanary/B.class:
+Type `androidx.work.Worker` was not found, it is required for default or static interface methods desugaring
+";
+
+        let (shown, hidden) = split_d8_noise(output);
+        assert_eq!(
+            shown,
+            [
+                "Warning in /x/leakcanary.jar:leakcanary/B.class:",
+                "Type `androidx.work.Worker` was not found, it is required for default or static interface methods desugaring",
+            ]
+        );
+        assert_eq!(hidden, 6);
+    }
 }
