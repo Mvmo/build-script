@@ -1,12 +1,12 @@
 // Functions: signatures with typed parameters, how arguments bind to them, builtins and functions of the script
 use std::fmt;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::language::lexer::Span;
 use crate::language::parser::Expression;
 
 use super::error::{RuntimeError, RuntimeErrorType, snake_case};
-use super::values::{BuiltModule, Type, Value};
+use super::values::{BuiltModule, PendingModule, Type, Value};
 use super::{BuildScriptContext, ScopeRef};
 
 pub type BuiltinFunction = fn(&BuildScriptContext, &Args) -> Result<Value, String>;
@@ -53,7 +53,7 @@ pub struct FunctionSignature {
 pub struct UserFunction {
     /// the variable it was assigned to when it was defined, for messages
     pub name: String,
-    pub signature: Rc<FunctionSignature>,
+    pub signature: Arc<FunctionSignature>,
     /// the last expression is the value of a call
     pub(super) body: Vec<Expression>,
     /// where it was defined, the body sees the variables there
@@ -93,7 +93,7 @@ pub fn builtin(
 ) -> Value {
     return Value::Builtin {
         name,
-        signature: Rc::new(signature),
+        signature: Arc::new(signature),
         function,
     };
 }
@@ -407,9 +407,18 @@ impl Args {
             .collect();
     }
 
-    /// The modules among all arguments, also inside lists
-    pub fn modules(&self) -> Vec<Rc<BuiltModule>> {
-        fn collect(value: &Value, modules: &mut Vec<Rc<BuiltModule>>) {
+    /// The modules among all arguments, also inside lists, once they are built
+    pub fn modules(&self) -> Vec<Arc<BuiltModule>> {
+        return self
+            .pending_modules()
+            .iter()
+            .filter_map(|module| module.wait().ok())
+            .collect();
+    }
+
+    /// The modules among all arguments, also inside lists, maybe still building
+    pub fn pending_modules(&self) -> Vec<Arc<PendingModule>> {
+        fn collect(value: &Value, modules: &mut Vec<Arc<PendingModule>>) {
             match value {
                 Value::Module(module) => modules.push(module.clone()),
                 Value::List(items) => items.iter().for_each(|item| collect(item, modules)),
@@ -481,12 +490,12 @@ impl FromValue for bool {
     }
 }
 
-impl FromValue for Rc<BuiltModule> {
+impl FromValue for Arc<BuiltModule> {
     fn from_value(value: &Value) -> Option<Self> {
         let Value::Module(module) = value else {
             return None;
         };
-        return Some(module.clone());
+        return module.wait().ok();
     }
 }
 

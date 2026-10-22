@@ -4,17 +4,19 @@ mod language;
 mod project;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use common::settings::Settings;
 use language::parser::Parser;
-use language::runtime::{self, Runtime, TestCounts, TestOutcome, TestSelection};
+use language::runtime::{self, BuiltModule, Runtime, TestCounts, TestOutcome, TestSelection};
 
 const USAGE: &str = "usage: build-script [build] [<script>]
        build-script run [--module <name>] [<script>] [-- <args>...]
        build-script test [--module <name>] [<script>]
        build-script new <kind> <path> [--package <package>]
        build-script add <kind> <name> [<script>] [--package <package>]
-       build-script config [<setting> [<value>]] | config --unset <setting>";
+       build-script config [<setting> [<value>]] | config --unset <setting>
+build, run and test take --jobs <n>, the number of modules built at the same time";
 
 /// what commands without a script argument build
 const DEFAULT_SCRIPT: &str = "project.build";
@@ -211,6 +213,11 @@ The script is {DEFAULT_SCRIPT} in the current directory unless one is given, see
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    let (jobs, args) = take_jobs(&args).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2);
+    });
+
     let command = parse_args(&args).unwrap_or_else(|usage| {
         eprintln!("{usage}");
         std::process::exit(2);
@@ -271,18 +278,38 @@ fn main() {
         _ => TestSelection::None,
     };
 
-    let runtime = run_script(script_path, tests);
+    let modules = run_script(script_path, tests, jobs.unwrap_or_else(runtime::default_jobs));
 
     match &command {
         Command::Run { module, args, .. } => {
-            std::process::exit(run_module(&runtime, module.as_deref(), args))
+            std::process::exit(run_module(&modules, module.as_deref(), args))
         }
-        Command::Test { module, .. } => std::process::exit(run_tests(&runtime, module.as_deref())),
+        Command::Test { module, .. } => std::process::exit(run_tests(&modules, module.as_deref())),
         _ => {}
     }
 }
 
-fn run_script(script_path: &str, tests: TestSelection) -> Runtime {
+/// `--jobs <n>` of the commands that build, before the arguments of a program after `--`
+fn take_jobs(args: &[String]) -> Result<(Option<usize>, Vec<String>), String> {
+    let program_args = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
+    let (jobs, mut own) = take_option(&args[..program_args], "--jobs")?;
+    own.extend(args[program_args..].iter().cloned());
+
+    let jobs = match jobs {
+        Some(jobs) => Some(
+            jobs.parse::<usize>()
+                .ok()
+                .filter(|jobs| *jobs > 0)
+                .ok_or_else(|| format!("--jobs needs a number above 0, not {jobs}"))?,
+        ),
+        None => None,
+    };
+
+    return Ok((jobs, own));
+}
+
+/// The modules the script built, the builds of independent modules ran in parallel
+fn run_script(script_path: &str, tests: TestSelection, jobs: usize) -> Vec<Arc<BuiltModule>> {
     let source = std::fs::read_to_string(script_path).unwrap_or_else(|error| {
         eprintln!("could not read {script_path}: {error}");
         std::process::exit(1);
@@ -304,15 +331,24 @@ fn run_script(script_path: &str, tests: TestSelection) -> Runtime {
         .map(|parent| parent.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut runtime = Runtime::new(project_dir).with_tests(tests);
+    let mut runtime = Runtime::new(project_dir).with_tests(tests).with_jobs(jobs);
+    let evaluated = runtime.run(&script);
 
-    if let Err(error) = runtime.run(&script) {
+    // builds that started before an error finish, none of their tools keep running
+    let built = runtime.finish();
+
+    let errors = match (evaluated, built) {
+        (Ok(()), Ok(modules)) => return modules,
+        (Err(error), _) => vec![error],
+        (Ok(()), Err(errors)) => errors,
+    };
+
+    for error in errors {
         let (line, column) = line_column(&source, error.span.start);
         eprintln!("{script_path}:{line}:{column}: {error}");
-        std::process::exit(1);
     }
 
-    return runtime;
+    std::process::exit(1);
 }
 
 /// The settings file and what it holds, or one setting shown, set or removed
@@ -370,9 +406,7 @@ fn line_column(source: &str, offset: usize) -> (usize, usize) {
 }
 
 /// Starts a module the script built and returns the exit code for the process
-fn run_module(runtime: &Runtime, name: Option<&str>, args: &[String]) -> i32 {
-    let built = runtime.built_modules();
-
+fn run_module(built: &[Arc<BuiltModule>], name: Option<&str>, args: &[String]) -> i32 {
     let module = match name {
         Some(name) => built.iter().rev().find(|module| module.name == name),
         None => built.iter().rev().find(|module| module.can_launch()),
@@ -380,7 +414,7 @@ fn run_module(runtime: &Runtime, name: Option<&str>, args: &[String]) -> i32 {
 
     let Some(module) = module else {
         match name {
-            Some(name) => eprintln!("run: {}", no_module_named(runtime, name)),
+            Some(name) => eprintln!("run: {}", no_module_named(built, name)),
             None => eprintln!(
                 "run: the script built nothing to run (build_kotlin with a main_class, or build_android)"
             ),
@@ -403,16 +437,15 @@ fn run_module(runtime: &Runtime, name: Option<&str>, args: &[String]) -> i32 {
 
 /// Runs the tests of every selected module once all are built, in build order.
 /// Exit code 1 if the tests of one failed.
-fn run_tests(runtime: &Runtime, name: Option<&str>) -> i32 {
-    let selected: Vec<_> = runtime
-        .built_modules()
+fn run_tests(built: &[Arc<BuiltModule>], name: Option<&str>) -> i32 {
+    let selected: Vec<_> = built
         .iter()
         .filter(|module| name.is_none_or(|name| module.name == name))
         .collect();
 
     match name {
         Some(name) if selected.is_empty() => {
-            eprintln!("test: {}", no_module_named(runtime, name));
+            eprintln!("test: {}", no_module_named(built, name));
             return 1;
         }
         None if selected.is_empty() => {
@@ -472,9 +505,8 @@ fn suite_label(module: &str, source_set: &str) -> String {
     return format!("{module} ({source_set})");
 }
 
-fn no_module_named(runtime: &Runtime, name: &str) -> String {
-    let built: Vec<&str> = runtime
-        .built_modules()
+fn no_module_named(built: &[Arc<BuiltModule>], name: &str) -> String {
+    let built: Vec<&str> = built
         .iter()
         .map(|module| module.name.as_str())
         .collect();
@@ -777,6 +809,21 @@ mod tests {
             "> Tests\n  core  passed, 1 test\n1 passed"
         );
         assert_eq!(suite_label("app", "androidTest"), "app (androidTest)");
+    }
+
+    #[test]
+    fn jobs_are_taken_before_the_arguments_of_the_program() {
+        let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            take_jobs(&args(&["build", "--jobs", "3"])),
+            Ok((Some(3), args(&["build"])))
+        );
+        assert_eq!(
+            take_jobs(&args(&["run", "--", "--jobs", "1"])),
+            Ok((None, args(&["run", "--", "--jobs", "1"])))
+        );
+        assert!(take_jobs(&args(&["test", "--jobs", "0"])).is_err());
     }
 
     #[test]

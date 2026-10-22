@@ -93,7 +93,7 @@ fn build_module(
         java: inputs.jdk.tool("java"),
     });
 
-    return Ok(Value::Module(inputs.built_module(
+    return Ok(Value::from(inputs.built_module(
         Some(jar.clone()),
         None,
         jar,
