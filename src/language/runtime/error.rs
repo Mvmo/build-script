@@ -80,6 +80,11 @@ pub enum RuntimeErrorType {
     CallsTooDeep {
         function: String,
     },
+    /// of an if, &&, ||
+    NotBool {
+        what: &'static str,
+        got: Type,
+    },
     Unsupported {
         feature: String,
     },
@@ -274,6 +279,9 @@ impl fmt::Display for RuntimeError {
             }
             RuntimeErrorType::DuplicateParameter { function, param } => {
                 return write!(f, "{function}: parameter '{param}' is declared twice");
+            }
+            RuntimeErrorType::NotBool { what, got } => {
+                return write!(f, "{what} must be bool, got {got}");
             }
             RuntimeErrorType::CallsTooDeep { function } => {
                 return write!(

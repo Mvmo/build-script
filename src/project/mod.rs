@@ -362,8 +362,8 @@ fn variable_name(name: &str) -> String {
         })
         .collect();
 
-    if variable == "use"
-        || variable == "fn"
+    // keywords of the language and builtins cannot be variables of modules
+    if ["use", "fn", "if", "else"].contains(&variable.as_str())
         || runtime::builtin_names().contains(&variable.as_str())
     {
         return format!("{variable}_module");
