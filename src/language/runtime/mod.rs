@@ -735,6 +735,37 @@ fn core_functions() -> Vec<(&'static str, Value)> {
             ),
         ),
         (
+            "env",
+            builtin(
+                "env",
+                FunctionParams::new()
+                    .required("name", Type::String)
+                    .optional("default", Type::String)
+                    .returns(Type::String),
+                |_, args| {
+                    let name: String = args.get("name")?;
+
+                    if let Ok(value) = std::env::var(&name) {
+                        return Ok(value.into());
+                    }
+
+                    return args.get::<Option<String>>("default")?.map(Value::from).ok_or_else(|| {
+                        format!("the environment variable {name} is not set, a default = ... would be taken then")
+                    });
+                },
+            ),
+        ),
+        (
+            "has_env",
+            builtin(
+                "has_env",
+                FunctionParams::new()
+                    .required("name", Type::String)
+                    .returns(Type::Bool),
+                |_, args| Ok(Value::Bool(std::env::var_os(args.get::<String>("name")?).is_some())),
+            ),
+        ),
+        (
             "current_time_millis",
             builtin(
                 "current_time_millis",
@@ -831,6 +862,23 @@ mod tests {
         // what a block defines stays in it
         let error = run("if true { inner = 1 }\ny = inner").err().unwrap();
         assert!(matches!(error.variant, RuntimeErrorType::UndefinedVariable { .. }));
+    }
+
+    #[test]
+    fn environment_variables_with_a_default() {
+        let runtime = run(r#"
+            home = env("HOME")
+            missing = env("BUILD_SCRIPT_SURELY_NOT_SET", default = "fallback")
+            has = has_env("HOME") && !has_env("BUILD_SCRIPT_SURELY_NOT_SET")
+        "#)
+        .unwrap();
+
+        assert_eq!(string(&runtime, "home"), std::env::var("HOME").unwrap());
+        assert_eq!(string(&runtime, "missing"), "fallback");
+        assert_eq!(string(&runtime, "has"), "true");
+
+        let error = run(r#"x = env("BUILD_SCRIPT_SURELY_NOT_SET")"#).err().unwrap();
+        assert!(error.to_string().contains("BUILD_SCRIPT_SURELY_NOT_SET is not set"), "{error}");
     }
 
     /// A JVM library that cannot be started
