@@ -37,6 +37,24 @@ pub struct NewModule {
     pub dependencies: Vec<(String, String)>,
 }
 
+/// What the settings file can hold: name and meaning
+pub const SETTINGS: &[(&str, &str)] = &[
+    (
+        DOMAIN,
+        "your domain, like mvmo.dev: the names of new modules start with it, Java and Kotlin packages reversed",
+    ),
+    (
+        REMEMBER_DOMAIN,
+        "never: new and add do not offer to remember the domain they asked for",
+    ),
+];
+
+const DOMAIN: &str = "domain";
+const REMEMBER_DOMAIN: &str = "remember_domain";
+
+/// when there is no one to ask, like in the examples of the Java naming conventions
+const DEFAULT_DOMAIN: &str = "example.com";
+
 pub fn project_kinds() -> Vec<&'static str> {
     return templates::PROJECT_KINDS
         .iter()
@@ -212,6 +230,104 @@ pub fn add_module(
     }
 
     return Ok(());
+}
+
+/// The developer's domain, which the names of new modules start with in every
+/// language: the remembered one, else asked for in a terminal and offered to
+/// remember, else example.com
+pub fn domain() -> Result<String, String> {
+    let mut settings = Settings::load()?;
+
+    if let Some(domain) = settings.get(DOMAIN) {
+        return checked_domain(domain)
+            .map_err(|error| format!("{}: {error}", settings.file().display()));
+    }
+
+    if !io::stdin().is_terminal() {
+        return Ok(DEFAULT_DOMAIN.to_string());
+    }
+
+    let domain = loop {
+        let answer = system::prompt(&format!(
+            "Your domain, which names start with, like mvmo.dev [{DEFAULT_DOMAIN}]: "
+        ))?;
+
+        let domain = if answer.is_empty() {
+            DEFAULT_DOMAIN.to_string()
+        } else {
+            answer
+        };
+
+        match checked_domain(&domain) {
+            Ok(domain) => break domain,
+            Err(error) => println!("{error}"),
+        }
+    };
+
+    if settings.get(REMEMBER_DOMAIN) != Some("never") {
+        match system::prompt(&format!(
+            "Remember {domain} for the next projects? (Y/n/never): "
+        ))?
+        .as_str()
+        {
+            "" | "y" | "yes" => {
+                settings.set(DOMAIN, &domain)?;
+                println!(
+                    "Remembered in {}, build-script config {DOMAIN} <domain> changes it",
+                    settings.file().display()
+                );
+            }
+            "never" => {
+                settings.set(REMEMBER_DOMAIN, "never")?;
+                println!("Not offered again, build-script config {DOMAIN} <domain> remembers one");
+            }
+            _ => {}
+        }
+    }
+
+    return Ok(domain);
+}
+
+/// The value as the settings file keeps it, checked
+pub fn checked_setting(name: &str, value: &str) -> Result<String, String> {
+    match name {
+        DOMAIN => return checked_domain(value),
+        REMEMBER_DOMAIN if value == "never" => return Ok(value.to_string()),
+        REMEMBER_DOMAIN => {
+            return Err(format!(
+                "{REMEMBER_DOMAIN} can only be never, unset it to be offered again"
+            ));
+        }
+        _ => {
+            let known: Vec<&str> = SETTINGS.iter().map(|(name, _)| *name).collect();
+            return Err(format!(
+                "unknown setting '{name}' (known: {})",
+                known.join(", ")
+            ));
+        }
+    }
+}
+
+/// Labels of letters, digits and hyphens, separated by dots, in lower case
+fn checked_domain(domain: &str) -> Result<String, String> {
+    let domain = domain.to_ascii_lowercase();
+
+    let valid = domain.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|char| char.is_ascii_alphanumeric() || char == '-')
+    });
+
+    if !valid {
+        return Err(format!(
+            "'{domain}' is not a domain: labels of letters, digits and hyphens separated by dots, like mvmo.dev"
+        ));
+    }
+
+    return Ok(domain);
 }
 
 /// Letters, digits, - and _, starting with a letter
