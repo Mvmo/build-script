@@ -139,45 +139,52 @@ fn install_jdk(
         return Ok(Jdk { home });
     }
 
-    let package = find_jdk_package(java_version, distribution, &platform)?;
-    println!(
-        "installing JDK {distribution} {} ({})",
-        package.java_version,
-        system::format_size(package.size)
-    );
+    // builds on other threads may need the same JDK, the first installs it
+    return system::installing(|| {
+        if let Some(home) = find_jdk_home(&target, 0) {
+            return Ok(Jdk { home });
+        }
 
-    if package.checksum.is_none() {
+        let package = find_jdk_package(java_version, distribution, &platform)?;
         println!(
-            "Warning: no SHA-256 checksum available for {}",
-            package.filename
+            "installing JDK {distribution} {} ({})",
+            package.java_version,
+            system::format_size(package.size)
         );
-    }
 
-    // extracted completely before it is renamed: a half extracted jdk is never used
-    let unpacked = PathBuf::from(format!("{}.tmp", target.display()));
-    let checksum = package.checksum.as_deref().map(|checksum| (256, checksum));
-    system::download_and_extract(
-        &package.url,
-        &jdks_dir.join(&package.filename),
-        checksum,
-        &unpacked,
-    )?;
+        if package.checksum.is_none() {
+            println!(
+                "Warning: no SHA-256 checksum available for {}",
+                package.filename
+            );
+        }
 
-    let Some(home) = find_jdk_home(&unpacked, 0) else {
-        return Err(format!("{} does not contain a JDK", package.filename));
-    };
+        // extracted completely before it is renamed: a half extracted jdk is never used
+        let unpacked = PathBuf::from(format!("{}.tmp", target.display()));
+        let checksum = package.checksum.as_deref().map(|checksum| (256, checksum));
+        system::download_and_extract(
+            &package.url,
+            &jdks_dir.join(&package.filename),
+            checksum,
+            &unpacked,
+        )?;
 
-    let relative_home = home
-        .strip_prefix(&unpacked)
-        .unwrap_or(Path::new(""))
-        .to_path_buf();
+        let Some(home) = find_jdk_home(&unpacked, 0) else {
+            return Err(format!("{} does not contain a JDK", package.filename));
+        };
 
-    system::remove_dir(&target)?;
-    fs::rename(&unpacked, &target)
-        .map_err(|error| format!("could not create {}: {error}", target.display()))?;
+        let relative_home = home
+            .strip_prefix(&unpacked)
+            .unwrap_or(Path::new(""))
+            .to_path_buf();
 
-    return Ok(Jdk {
-        home: target.join(relative_home),
+        system::remove_dir(&target)?;
+        fs::rename(&unpacked, &target)
+            .map_err(|error| format!("could not create {}: {error}", target.display()))?;
+
+        return Ok(Jdk {
+            home: target.join(relative_home),
+        });
     });
 }
 

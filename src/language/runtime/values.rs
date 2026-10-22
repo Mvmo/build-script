@@ -5,11 +5,12 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::common::up_to_date::InputFingerprint;
 use crate::common::{system, xml};
 use crate::jvm::{self, JvmOutput};
+use crate::language::lexer::Span;
 
 use super::functions::{BuiltinFunction, FunctionSignature, UserFunction};
 
@@ -19,15 +20,15 @@ pub enum Value {
     Int(i64),
     Bool(bool),
     List(Vec<Value>),
-    Module(Rc<BuiltModule>),
+    Module(Arc<PendingModule>),
     Unit,
     Builtin {
         name: &'static str,
-        signature: Rc<FunctionSignature>,
+        signature: Arc<FunctionSignature>,
         function: BuiltinFunction,
     },
     /// defined by the script with fn (...) { ... }
-    Function(Rc<UserFunction>),
+    Function(Arc<UserFunction>),
 }
 
 /// Types of values, checked whenever arguments are bound to parameters. They
@@ -41,7 +42,7 @@ pub enum Type {
     String,
     Module,
     List(Box<Type>),
-    Function(Rc<FunctionSignature>),
+    Function(Arc<FunctionSignature>),
     /// one of several types: str | module
     Union(Vec<Type>),
 }
@@ -56,10 +57,29 @@ pub struct BuiltModule {
     /// the file to run or install, what the module is in a script
     pub artifact: PathBuf,
     /// modules of the script it depends on
-    pub modules: Vec<Rc<BuiltModule>>,
+    pub modules: Vec<Arc<BuiltModule>>,
     pub output: ModuleOutput,
     /// empty when `build-script test` did not select it
     pub tests: Vec<TestSuite>,
+}
+
+/// A module whose build may still run on a thread of its own. Whatever needs what
+/// it built waits for it, so modules that do not depend on each other build in parallel.
+#[derive(Debug)]
+pub struct PendingModule {
+    /// the function that builds it and where the script calls it, for its error
+    pub function: &'static str,
+    pub span: Span,
+    result: Mutex<Option<Result<Arc<BuiltModule>, BuildFailure>>>,
+    done: Condvar,
+}
+
+#[derive(Debug, Clone)]
+pub enum BuildFailure {
+    /// what the build function said
+    Failed(String),
+    /// a module it depends on failed, that one says why
+    DependencyFailed,
 }
 
 /// Tests of one source set of a module, like src/test or src/androidTest
@@ -79,7 +99,7 @@ pub enum ModuleTests {
 }
 
 /// Runs compiled tests: a command line, or what a platform needs besides, like a device
-pub trait TestRunner: fmt::Debug {
+pub trait TestRunner: fmt::Debug + Send + Sync {
     /// A failure is the outcome, not an error
     fn run(&self, module: &str) -> TestOutcome;
 }
@@ -204,6 +224,41 @@ impl Type {
     }
 }
 
+impl PendingModule {
+    pub fn new(function: &'static str, span: Span) -> Arc<Self> {
+        return Arc::new(PendingModule {
+            function,
+            span,
+            result: Mutex::new(None),
+            done: Condvar::new(),
+        });
+    }
+
+    /// Of a build function that built it right away
+    pub fn built(module: Arc<BuiltModule>) -> Arc<Self> {
+        let pending = Self::new("", Span::new(0, 0));
+        pending.finish(Ok(module));
+
+        return pending;
+    }
+
+    pub fn finish(&self, result: Result<Arc<BuiltModule>, BuildFailure>) {
+        *self.result.lock().unwrap() = Some(result);
+        self.done.notify_all();
+    }
+
+    /// What the build gave, once it is done
+    pub fn wait(&self) -> Result<Arc<BuiltModule>, BuildFailure> {
+        let mut result = self.result.lock().unwrap();
+
+        while result.is_none() {
+            result = self.done.wait(result).unwrap();
+        }
+
+        return result.clone().unwrap();
+    }
+}
+
 impl ModuleTests {
     pub fn run(&self, module: &str) -> TestOutcome {
         match self {
@@ -323,15 +378,15 @@ impl TestCounts {
 
 impl BuiltModule {
     /// The given modules and everything they depend on, each once, dependencies first
-    pub fn transitive(modules: &[Rc<BuiltModule>]) -> Vec<Rc<BuiltModule>> {
+    pub fn transitive(modules: &[Arc<BuiltModule>]) -> Vec<Arc<BuiltModule>> {
         // a module reached again is not descended into again: modules many
         // others depend on would be visited once per path to them
         fn visit(
-            module: &Rc<BuiltModule>,
+            module: &Arc<BuiltModule>,
             seen: &mut HashSet<*const BuiltModule>,
-            out: &mut Vec<Rc<BuiltModule>>,
+            out: &mut Vec<Arc<BuiltModule>>,
         ) {
-            if !seen.insert(Rc::as_ptr(module)) {
+            if !seen.insert(Arc::as_ptr(module)) {
                 return;
             }
 
@@ -370,10 +425,13 @@ impl Hash for Value {
             Value::Int(int) => int.hash(state),
             Value::Bool(bool) => bool.hash(state),
             Value::List(items) => items.hash(state),
-            Value::Module(module) => {
-                module.name.hash(state);
-                module.artifact.hash(state);
-            }
+            Value::Module(module) => match module.wait() {
+                Ok(module) => {
+                    module.name.hash(state);
+                    module.artifact.hash(state);
+                }
+                Err(_) => module.function.hash(state),
+            },
             Value::Unit => {}
             Value::Builtin { name, .. } => name.hash(state),
             Value::Function(function) => function.name.hash(state),
@@ -407,7 +465,10 @@ impl fmt::Display for Value {
             Value::String(str) => return write!(f, "{str}"),
             Value::Int(int) => return write!(f, "{int}"),
             Value::Bool(bool) => return write!(f, "{bool}"),
-            Value::Module(module) => return write!(f, "{}", module.artifact.display()),
+            Value::Module(module) => match module.wait() {
+                Ok(module) => return write!(f, "{}", module.artifact.display()),
+                Err(_) => return write!(f, "<failed {}>", module.function),
+            },
             Value::List(items) => {
                 let items: Vec<String> = items.iter().map(|item| item.to_string()).collect();
                 return write!(f, "[{}]", items.join(", "));
@@ -465,9 +526,9 @@ impl From<i64> for Value {
     }
 }
 
-impl From<Rc<BuiltModule>> for Value {
-    fn from(value: Rc<BuiltModule>) -> Self {
-        return Value::Module(value);
+impl From<Arc<BuiltModule>> for Value {
+    fn from(value: Arc<BuiltModule>) -> Self {
+        return Value::Module(PendingModule::built(value));
     }
 }
 

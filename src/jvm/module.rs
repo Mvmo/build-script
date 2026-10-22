@@ -1,7 +1,7 @@
 // JVM module builds: what every module function reads from its arguments, resolving it, compiling it with kotlinc and javac, jars
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::common::system;
 use crate::common::up_to_date::InputFingerprint;
@@ -97,7 +97,7 @@ pub struct ModuleBuildInputs {
 pub struct Dependencies {
     pub libraries: Vec<MavenCoordinate>,
     pub platforms: Vec<MavenCoordinate>,
-    pub modules: Vec<Rc<BuiltModule>>,
+    pub modules: Vec<Arc<BuiltModule>>,
 }
 
 pub struct ResolvedDependencies {
@@ -111,7 +111,7 @@ pub struct ResolvedDependencies {
     /// jars and aars only to compile against
     pub compile_only: Vec<PathBuf>,
     /// all modules depended on, dependencies first
-    pub modules: Vec<Rc<BuiltModule>>,
+    pub modules: Vec<Arc<BuiltModule>>,
     /// jars of the javac processors and what they need
     pub annotation_processor_path: Vec<PathBuf>,
     pub symbol_processors: Option<ResolvedSymbolProcessors>,
@@ -618,8 +618,8 @@ impl ModuleBuildInputs {
         artifact: PathBuf,
         launch: Option<JvmLaunch>,
         tests: Vec<TestSuite>,
-    ) -> Rc<BuiltModule> {
-        return Rc::new(BuiltModule {
+    ) -> Arc<BuiltModule> {
+        return Arc::new(BuiltModule {
             name: self.name.clone(),
             directory: self.directory.clone(),
             artifact,
@@ -652,7 +652,12 @@ impl Dependencies {
                         dependencies.platforms.push(coordinate)
                     }
                 },
-                Value::Module(module) => dependencies.modules.push(module),
+                Value::Module(module) => {
+                    let module = module
+                        .wait()
+                        .map_err(|_| format!("{} it depends on failed", module.function))?;
+                    dependencies.modules.push(module);
+                }
                 other => {
                     return Err(format!(
                         "internal error: dependency of type {}",

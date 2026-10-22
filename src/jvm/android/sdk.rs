@@ -103,7 +103,14 @@ impl AndroidSdk {
         }
 
         let target = sdk_root.join("platform-tools");
-        SdkCatalog::load()?.install(sdk_root, "platform-tools", &target, false)?;
+
+        system::installing(|| {
+            if !target.join(&name).is_file() {
+                SdkCatalog::load()?.install(sdk_root, "platform-tools", &target, false)?;
+            }
+
+            return Ok(());
+        })?;
 
         return Ok(target.join(name));
     }
@@ -133,41 +140,50 @@ impl AndroidSdk {
             return Ok(sdk);
         }
 
-        let catalog = SdkCatalog::load()?;
+        // builds on other threads may need the same packages, the first installs them
+        return system::installing(|| {
+            let sdk = Self::at(&root, compile_sdk, build_tools);
 
-        if !sdk.android_jar.is_file() {
-            let platform = Self::platform_names(compile_sdk)
-                .into_iter()
-                .find(|name| catalog.package(&format!("platforms;{name}")).is_some())
-                .ok_or_else(|| format!("the Android SDK has no platform for API {compile_sdk}"))?;
+            if sdk.is_complete() {
+                return Ok(sdk);
+            }
 
-            catalog.install(
-                &root,
-                &format!("platforms;{platform}"),
-                &root.join("platforms").join(&platform),
-                accept_license,
-            )?;
-        }
+            let catalog = SdkCatalog::load()?;
 
-        if !sdk.aapt2.is_file() {
-            catalog.install(
-                &root,
-                &format!("build-tools;{build_tools}"),
-                &root.join("build-tools").join(build_tools),
-                accept_license,
-            )?;
-        }
+            if !sdk.android_jar.is_file() {
+                let platform = Self::platform_names(compile_sdk)
+                    .into_iter()
+                    .find(|name| catalog.package(&format!("platforms;{name}")).is_some())
+                    .ok_or_else(|| format!("the Android SDK has no platform for API {compile_sdk}"))?;
 
-        let sdk = Self::at(&root, compile_sdk, build_tools);
+                catalog.install(
+                    &root,
+                    &format!("platforms;{platform}"),
+                    &root.join("platforms").join(&platform),
+                    accept_license,
+                )?;
+            }
 
-        if !sdk.is_complete() {
-            return Err(format!(
-                "the Android SDK in {} is incomplete",
-                root.display()
-            ));
-        }
+            if !sdk.aapt2.is_file() {
+                catalog.install(
+                    &root,
+                    &format!("build-tools;{build_tools}"),
+                    &root.join("build-tools").join(build_tools),
+                    accept_license,
+                )?;
+            }
 
-        return Ok(sdk);
+            let sdk = Self::at(&root, compile_sdk, build_tools);
+
+            if !sdk.is_complete() {
+                return Err(format!(
+                    "the Android SDK in {} is incomplete",
+                    root.display()
+                ));
+            }
+
+            return Ok(sdk);
+        });
     }
 
     /// Platforms are android-36 up to API 36, from API 37 on android-37.0

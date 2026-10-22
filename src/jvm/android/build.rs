@@ -1415,10 +1415,15 @@ impl CMakeBuild<'_> {
         ];
 
         if packages.iter().any(|(_, dir)| !dir.is_dir()) {
-            let catalog = SdkCatalog::load()?;
-            for (package, dir) in packages.iter().filter(|(_, dir)| !dir.is_dir()) {
-                catalog.install(self.sdk_root, package, dir, self.accept_license)?;
-            }
+            system::installing(|| {
+                let catalog = SdkCatalog::load()?;
+
+                for (package, dir) in packages.iter().filter(|(_, dir)| !dir.is_dir()) {
+                    catalog.install(self.sdk_root, package, dir, self.accept_license)?;
+                }
+
+                return Ok(());
+            })?;
         }
 
         let cmake = cmake_home
@@ -1526,7 +1531,7 @@ fn compiled_resources(
 
 fn compile_resources(aapt2: &Path, res_dir: &Path, output: &Path) -> Result<(), String> {
     system::create_parent_dir(output)?;
-    let partial = PathBuf::from(format!("{}.part", output.display()));
+    let partial = system::partial_path(output);
     let mut command = Command::new(aapt2);
     command
         .arg("compile")

@@ -3,10 +3,9 @@ mod error;
 mod functions;
 mod values;
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::jvm;
 use crate::language::lexer::Span;
@@ -15,13 +14,13 @@ use crate::language::parser::{
     TypeExpression, TypeExpressionType, UnaryOperator, UseTarget,
 };
 
-use functions::{CallArgument, FunctionParam, ParamDefault, UserFunction, bind};
+use functions::{BuiltinFunction, CallArgument, FunctionParam, ParamDefault, UserFunction, bind};
 
 pub use error::{RuntimeError, RuntimeErrorType};
 pub use functions::{Args, FunctionParams, FunctionSignature, builtin};
 pub use values::{
-    BuiltModule, ModuleOutput, ModuleTests, TestCounts, TestOutcome, TestRun, TestRunner,
-    TestSuite, Type, Value, launch,
+    BuildFailure, BuiltModule, ModuleOutput, ModuleTests, PendingModule, TestCounts, TestOutcome,
+    TestRun, TestRunner, TestSuite, Type, Value, launch,
 };
 
 /// The build functions a script loads with `use <name>`
@@ -31,6 +30,7 @@ pub struct Platform {
 }
 
 /// What builtins know about the running script
+#[derive(Clone)]
 pub struct BuildScriptContext {
     /// relative paths of the script are resolved against it
     pub project_dir: PathBuf,
@@ -50,10 +50,20 @@ pub struct Runtime {
     /// the scope of the script, or of the function being called
     scope: ScopeRef,
     context: BuildScriptContext,
-    /// every module a builtin returned, in build order
-    built: Vec<Rc<BuiltModule>>,
+    /// every module a builtin returned, in build order, maybe still building
+    built: Vec<Arc<PendingModule>>,
+    jobs: Arc<Jobs>,
     call_depth: usize,
 }
+
+/// How many builds run at the same time, like the workers of Gradle
+struct Jobs {
+    free: Mutex<usize>,
+    released: Condvar,
+}
+
+/// One of the jobs, free again when it is dropped
+struct Job<'a>(&'a Jobs);
 
 /// The platforms of every language category
 const PLATFORMS: &[&[Platform]] = &[jvm::PLATFORMS];
@@ -97,6 +107,7 @@ impl Runtime {
                 tests: TestSelection::None,
             },
             built: vec![],
+            jobs: Arc::new(Jobs::new(default_jobs())),
             call_depth: 0,
         };
 
@@ -115,6 +126,11 @@ impl Runtime {
         return self;
     }
 
+    pub fn with_jobs(mut self, jobs: usize) -> Self {
+        self.jobs = Arc::new(Jobs::new(jobs));
+        return self;
+    }
+
     pub fn run(&mut self, script: &Script) -> Result<(), RuntimeError> {
         for statement in &script.statements {
             self.run_statement(statement)?;
@@ -122,15 +138,35 @@ impl Runtime {
         return Ok(());
     }
 
-    /// In build order
-    pub fn built_modules(&self) -> &[Rc<BuiltModule>] {
-        return &self.built;
+    /// Waits for the builds still running. The modules in build order, or why builds
+    /// failed: modules whose dependencies failed leave it to the error of those.
+    pub fn finish(&self) -> Result<Vec<Arc<BuiltModule>>, Vec<RuntimeError>> {
+        let mut modules = vec![];
+        let mut errors = vec![];
+
+        for pending in &self.built {
+            match pending.wait() {
+                Ok(module) => modules.push(module),
+                Err(BuildFailure::Failed(message)) => errors.push(RuntimeError::builtin_failed(
+                    pending.function,
+                    message,
+                    pending.span,
+                )),
+                Err(BuildFailure::DependencyFailed) => {}
+            }
+        }
+
+        if errors.is_empty() {
+            return Ok(modules);
+        }
+
+        return Err(errors);
     }
 
     /// In the current scope, also when an outer scope has the name
     fn define(&mut self, name: &str, value: Value) {
         self.scope
-            .borrow_mut()
+            .lock().unwrap()
             .variables
             .insert(name.to_string(), value);
     }
@@ -178,7 +214,7 @@ impl Runtime {
                 }
                 return self
                     .scope
-                    .borrow()
+                    .lock().unwrap()
                     .get(name)
                     .ok_or_else(|| RuntimeError::undefined_variable(name.clone(), span));
             }
@@ -434,7 +470,7 @@ impl Runtime {
             (Value::String(l), Value::String(r)) => return Some(l == r),
             (Value::Int(l), Value::Int(r)) => return Some(l == r),
             (Value::Bool(l), Value::Bool(r)) => return Some(l == r),
-            (Value::Module(l), Value::Module(r)) => return Some(Rc::ptr_eq(l, r)),
+            (Value::Module(l), Value::Module(r)) => return Some(Arc::ptr_eq(l, r)),
             (Value::List(l), Value::List(r)) => {
                 if l.len() != r.len() {
                     return Some(false);
@@ -452,7 +488,7 @@ impl Runtime {
             (Value::Builtin { name: l, .. }, Value::Builtin { name: r, .. }) => {
                 return Some(l == r);
             }
-            (Value::Function(l), Value::Function(r)) => return Some(Rc::ptr_eq(l, r)),
+            (Value::Function(l), Value::Function(r)) => return Some(Arc::ptr_eq(l, r)),
             _ => return None,
         }
     }
@@ -518,9 +554,9 @@ impl Runtime {
             None => Type::Any,
         };
 
-        return Ok(Value::Function(Rc::new(UserFunction {
+        return Ok(Value::Function(Arc::new(UserFunction {
             name: name.to_string(),
-            signature: Rc::new(declared.returns(returns)),
+            signature: Arc::new(declared.returns(returns)),
             body: body.to_vec(),
             scope: self.scope.clone(),
         })));
@@ -564,7 +600,7 @@ impl Runtime {
                     });
                 }
 
-                return Ok(Type::Function(Rc::new(
+                return Ok(Type::Function(Arc::new(
                     signature.returns(Self::resolve_type(returns)?),
                 )));
             }
@@ -589,6 +625,15 @@ impl Runtime {
 
         let args = bind(name, &signature.params, arguments, span)?;
 
+        // modules build on threads of their own, the script goes on meanwhile
+        if matches!(signature.returns, Type::Module) {
+            let module = PendingModule::new(name, span);
+            self.built.push(module.clone());
+            self.build_in_background(module.clone(), function, args);
+
+            return Ok(Value::Module(module));
+        }
+
         let result = function(&self.context, &args)
             .map_err(|message| RuntimeError::builtin_failed(name, message, span))?;
 
@@ -601,11 +646,44 @@ impl Runtime {
             return Err(RuntimeError::builtin_failed(name, message, span));
         }
 
-        if let Value::Module(module) = &result {
-            self.built.push(module.clone());
-        }
-
         return Ok(result);
+    }
+
+    /// Once the modules it depends on are built, without holding a job while it waits
+    fn build_in_background(&self, module: Arc<PendingModule>, function: BuiltinFunction, args: Args) {
+        let context = self.context.clone();
+        let jobs = self.jobs.clone();
+
+        std::thread::spawn(move || {
+            let dependencies_built = args
+                .pending_modules()
+                .iter()
+                .all(|dependency| dependency.wait().is_ok());
+
+            if !dependencies_built {
+                module.finish(Err(BuildFailure::DependencyFailed));
+                return;
+            }
+
+            let _job = jobs.take();
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                function(&context, &args)
+            }));
+
+            let result = match built {
+                Ok(Ok(Value::Module(built))) => built.wait(),
+                Ok(Ok(other)) => Err(BuildFailure::Failed(format!(
+                    "internal error: returned {}, declared module",
+                    other.type_of()
+                ))),
+                Ok(Err(message)) => Err(BuildFailure::Failed(message)),
+                Err(_) => Err(BuildFailure::Failed(
+                    "internal error: the build panicked".to_string(),
+                )),
+            };
+
+            module.finish(result);
+        });
     }
 
     /// The body runs in a scope below the one the function was defined in, with
@@ -630,7 +708,7 @@ impl Runtime {
 
         for (name, value) in args.values {
             if let Some(value) = value {
-                scope.borrow_mut().variables.insert(name, value);
+                scope.lock().unwrap().variables.insert(name, value);
             }
         }
 
@@ -665,7 +743,7 @@ impl Runtime {
     }
 }
 
-type ScopeRef = Rc<RefCell<Scope>>;
+type ScopeRef = Arc<Mutex<Scope>>;
 
 /// The variables of the script or of a function call
 #[derive(Default)]
@@ -677,11 +755,11 @@ struct Scope {
 
 impl Scope {
     fn root() -> ScopeRef {
-        return Rc::new(RefCell::new(Scope::default()));
+        return Arc::new(Mutex::new(Scope::default()));
     }
 
     fn child(parent: &ScopeRef) -> ScopeRef {
-        return Rc::new(RefCell::new(Scope {
+        return Arc::new(Mutex::new(Scope {
             variables: HashMap::new(),
             parent: Some(parent.clone()),
         }));
@@ -691,7 +769,7 @@ impl Scope {
         if let Some(value) = self.variables.get(name) {
             return Some(value.clone());
         }
-        return self.parent.as_ref()?.borrow().get(name);
+        return self.parent.as_ref()?.lock().unwrap().get(name);
     }
 }
 
@@ -704,6 +782,42 @@ fn platform_names() -> Vec<&'static str> {
 }
 
 /// What every script has without `use`
+impl Jobs {
+    fn new(count: usize) -> Self {
+        return Jobs {
+            free: Mutex::new(count.max(1)),
+            released: Condvar::new(),
+        };
+    }
+
+    /// Waits until one is free
+    fn take(&self) -> Job<'_> {
+        let mut free = self.free.lock().unwrap();
+
+        while *free == 0 {
+            free = self.released.wait(free).unwrap();
+        }
+
+        *free -= 1;
+
+        return Job(self);
+    }
+}
+
+impl Drop for Job<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap() += 1;
+        self.0.released.notify_one();
+    }
+}
+
+/// Half the cores: kotlinc, javac and d8 use several threads each
+pub fn default_jobs() -> usize {
+    return std::thread::available_parallelism()
+        .map(|cores| (cores.get() / 2).max(1))
+        .unwrap_or(1);
+}
+
 fn core_functions() -> Vec<(&'static str, Value)> {
     return vec![
         (
@@ -795,7 +909,7 @@ fn core_functions() -> Vec<(&'static str, Value)> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use crate::jvm::{JvmOutput, maven};
     use crate::language::parser::Parser;
@@ -813,13 +927,18 @@ mod tests {
 
         runtime.run(&script)?;
 
+        // like the command line: the errors of builds count once they are done
+        if let Err(mut errors) = runtime.finish() {
+            return Err(errors.remove(0));
+        }
+
         return Ok(runtime);
     }
 
     fn variable(runtime: &Runtime, name: &str) -> Value {
         return runtime
             .scope
-            .borrow()
+            .lock().unwrap()
             .get(name)
             .unwrap_or_else(|| panic!("{name} is not defined"));
     }
@@ -1054,14 +1173,14 @@ mod tests {
 
         // function types compare by shape, parameter names do not matter
         let shape = |name: &str| {
-            Type::Function(Rc::new(
+            Type::Function(Arc::new(
                 FunctionParams::new()
                     .required(name, Type::String)
                     .returns(Type::Unit),
             ))
         };
 
-        let optional = Type::Function(Rc::new(
+        let optional = Type::Function(Arc::new(
             FunctionParams::new()
                 .optional("x", Type::String)
                 .returns(Type::Unit),
@@ -1086,7 +1205,7 @@ mod tests {
             "generate_sources",
         ] {
             assert!(
-                runtime.scope.borrow().get(function).is_some(),
+                runtime.scope.lock().unwrap().get(function).is_some(),
                 "{function} is missing"
             );
         }
@@ -1218,8 +1337,8 @@ mod tests {
         assert_eq!(string(&runtime, "my_fn"), "<fn my_fn>");
         // what a call assigns stays in its scope
         assert!(
-            runtime.scope.borrow().get("text").is_none()
-                && runtime.scope.borrow().get("local").is_none()
+            runtime.scope.lock().unwrap().get("text").is_none()
+                && runtime.scope.lock().unwrap().get("local").is_none()
         );
     }
 
@@ -1342,8 +1461,8 @@ mod tests {
 
     #[test]
     fn modules_list_their_dependencies_once() {
-        let module = |name: &str, modules: Vec<Rc<BuiltModule>>| {
-            Rc::new(BuiltModule {
+        let module = |name: &str, modules: Vec<Arc<BuiltModule>>| {
+            Arc::new(BuiltModule {
                 name: name.to_string(),
                 directory: PathBuf::from(name),
                 artifact: PathBuf::from(format!("{name}.jar")),
@@ -1363,14 +1482,78 @@ mod tests {
             .collect();
 
         assert_eq!(names, ["core", "data", "ui"]);
-        assert_eq!(Value::Module(core).to_string(), "core.jar");
+        assert_eq!(Value::from(core).to_string(), "core.jar");
+    }
+
+    #[test]
+    fn independent_modules_build_in_parallel_after_their_dependencies() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static RUNNING: AtomicUsize = AtomicUsize::new(0);
+        static MOST: AtomicUsize = AtomicUsize::new(0);
+        static FINISHED: Mutex<Vec<String>> = Mutex::new(vec![]);
+
+        fn slow(_: &BuildScriptContext, args: &Args) -> Result<Value, String> {
+            let name: String = args.get("name")?;
+
+            for dependency in args.modules() {
+                if !FINISHED.lock().unwrap().contains(&dependency.name) {
+                    return Err(format!("{} was not built before {name}", dependency.name));
+                }
+            }
+
+            if name == "broken" {
+                return Err("broken on purpose".to_string());
+            }
+
+            let running = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+            MOST.fetch_max(running, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            RUNNING.fetch_sub(1, Ordering::SeqCst);
+            FINISHED.lock().unwrap().push(name.clone());
+
+            return Ok(Value::from(Arc::new(BuiltModule {
+                artifact: PathBuf::from(format!("{name}.jar")),
+                name,
+                directory: PathBuf::from("."),
+                modules: vec![],
+                output: library_output(),
+                tests: vec![],
+            })));
+        }
+
+        let runtime_with_slow = || {
+            let signature = FunctionParams::new()
+                .required("name", Type::String)
+                .with_default("dependencies", Type::list(Type::Module), Value::List(vec![]))
+                .returns(Type::Module);
+            let mut runtime = Runtime::new(".").with_jobs(2);
+            runtime.define("slow", builtin("slow", signature, slow));
+
+            return runtime;
+        };
+
+        let source = "a = slow(\"a\")\nb = slow(\"b\")\nc = slow(\"c\", dependencies = list(a, b))";
+        run_in(runtime_with_slow(), source).unwrap();
+        assert_eq!(MOST.load(Ordering::SeqCst), 2);
+        assert_eq!(FINISHED.lock().unwrap().last().map(String::as_str), Some("c"));
+
+        // a module that fails is the error, not the modules that depend on it
+        let mut runtime = runtime_with_slow();
+        let script = Parser::new("x = slow(\"broken\")\ny = slow(\"after\", dependencies = list(x))")
+            .parse_script()
+            .unwrap();
+        runtime.run(&script).unwrap();
+        let errors = runtime.finish().err().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].to_string(), "slow: broken on purpose");
     }
 
     #[test]
     fn built_modules_are_remembered_for_run() {
         fn library(_: &BuildScriptContext, args: &Args) -> Result<Value, String> {
             let name: String = args.get("name")?;
-            return Ok(Value::Module(Rc::new(BuiltModule {
+            return Ok(Value::from(Arc::new(BuiltModule {
                 name: name.clone(),
                 directory: PathBuf::from("."),
                 artifact: PathBuf::from(format!("{name}.jar")),
@@ -1389,15 +1572,12 @@ mod tests {
         runtime.define("library", builtin("library", signature, library));
         let runtime = run_in(runtime, "core = library(\"core\")\nlibrary(\"app\")").unwrap();
 
-        let names: Vec<&str> = runtime
-            .built_modules()
-            .iter()
-            .map(|module| module.name.as_str())
-            .collect();
+        let built = runtime.finish().unwrap();
+        let names: Vec<&str> = built.iter().map(|module| module.name.as_str()).collect();
 
         assert_eq!(names, ["core", "app"]);
 
-        let error = launch(&runtime.built_modules()[0], &[]).unwrap_err();
+        let error = launch(&built[0], &[]).unwrap_err();
         assert!(error.contains("core cannot be run"), "{error}");
     }
 }

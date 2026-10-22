@@ -6,6 +6,8 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BUILD_SCRIPT_DIR_NAME: &str = "build-script";
 /// below the user's home, when neither BUILD_SCRIPT_HOME nor XDG is set
@@ -228,7 +230,7 @@ pub fn download(url: &str, target: &Path, show_progress: bool) -> Result<bool, S
     create_parent_dir(target)?;
 
     // renamed once complete, so no partial files are left behind
-    let partial = PathBuf::from(format!("{}.part", target.display()));
+    let partial = partial_path(target);
     let mut command = Command::new("curl");
     command
         .args([
@@ -441,11 +443,7 @@ pub fn kept_in_cache(
     }
 
     // renamed once complete, a build that stops half way leaves nothing behind
-    let partial = PathBuf::from(format!(
-        "{}.partial-{}",
-        target.display(),
-        std::process::id()
-    ));
+    let partial = partial_path(&target);
 
     remove_dir(&partial)?;
     produce(&partial)?;
@@ -464,6 +462,31 @@ pub fn kept_in_cache(
             ));
         }
     }
+}
+
+/// Where a file or directory is written before it is complete and renamed to
+/// `path`, its own for every caller: builds on several threads may write the same
+/// file at the same time, like an artifact two modules need
+pub fn partial_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let next = NEXT.fetch_add(1, Ordering::Relaxed);
+
+    return PathBuf::from(format!(
+        "{}.partial-{}-{next}",
+        path.display(),
+        std::process::id()
+    ));
+}
+
+/// One installation at a time: builds on several threads may need the same JDK or
+/// SDK package, the one after the first finds it installed
+pub fn installing<T>(install: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    static INSTALLING: Mutex<()> = Mutex::new(());
+    let _installing = INSTALLING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    return install();
 }
 
 /// One file of a zip archive, like a configuration inside a jar

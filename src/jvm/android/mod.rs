@@ -219,7 +219,7 @@ fn build_android(context: &BuildScriptContext, args: &Args) -> Result<Value, Str
 
     let tests = android_tests(context, args, &inputs, &sdk, classes.to_vec(), &settings);
 
-    return Ok(Value::Module(inputs.built_module(
+    return Ok(Value::from(inputs.built_module(
         None,
         None,
         apk,
@@ -332,7 +332,7 @@ fn build_android_library(context: &BuildScriptContext, args: &Args) -> Result<Va
         None => vec![],
     };
 
-    return Ok(Value::Module(inputs.built_module(
+    return Ok(Value::from(inputs.built_module(
         Some(jar.clone()),
         Some(android),
         jar,
