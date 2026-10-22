@@ -232,6 +232,55 @@ pub fn add_module(
     return Ok(());
 }
 
+/// Removes the build directories build-script wrote below the script's directory,
+/// those with fingerprints in them. Build directories of other tools stay.
+pub fn clean(script_file: &Path) -> Result<(), String> {
+    if !script_file.is_file() {
+        return Err(format!("{} does not exist", script_file.display()));
+    }
+
+    let project_dir = script_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut removed = vec![];
+    let mut pending = vec![project_dir.to_path_buf()];
+
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_dir = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+            let name = entry.file_name();
+
+            if !is_dir || name == "node_modules" || name == ".git" {
+                continue;
+            }
+
+            if name == "build" && path.join("fingerprints").is_dir() {
+                system::remove_dir(&path)?;
+                removed.push(path);
+            } else if name != "build" {
+                pending.push(path);
+            }
+        }
+    }
+
+    if removed.is_empty() {
+        println!("Nothing to clean below {}", project_dir.display());
+    }
+
+    removed.sort();
+    for directory in removed {
+        println!("Removed {}", directory.display());
+    }
+
+    return Ok(());
+}
+
 /// The developer's domain, which the names of new modules start with in every
 /// language: the remembered one, else asked for in a terminal and offered to
 /// remember, else example.com
@@ -402,6 +451,26 @@ mod tests {
         assert_eq!(variable_name("list"), "list_module");
         assert!(checked_name("1st").is_err());
         assert!(checked_name("a b").is_err());
+    }
+
+    #[test]
+    fn clean_removes_only_what_build_script_built() {
+        let root = std::env::temp_dir().join(format!("build-script-clean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        system::write_file(&root.join("project.build"), "use kotlin\n").unwrap();
+        system::write_file(&root.join("app/build/fingerprints/app"), "0").unwrap();
+        system::write_file(&root.join("app/build/libs/app.jar"), "").unwrap();
+        // what other tools built, and what the script has below node_modules
+        system::write_file(&root.join("web/build/index.html"), "").unwrap();
+        system::write_file(&root.join("node_modules/x/build/fingerprints/x"), "0").unwrap();
+
+        clean(&root.join("project.build")).unwrap();
+        assert!(!root.join("app/build").exists());
+        assert!(root.join("app").is_dir());
+        assert!(root.join("web/build/index.html").is_file());
+        assert!(root.join("node_modules/x/build/fingerprints/x").is_file());
+        assert!(clean(&root.join("missing.build")).unwrap_err().contains("does not exist"));
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

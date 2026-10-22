@@ -15,6 +15,7 @@ const USAGE: &str = "usage: build-script [build] [<script>]
        build-script test [--module <name>] [<script>]
        build-script new <kind> <path> [--package <package>]
        build-script add <kind> <name> [<script>] [--package <package>]
+       build-script clean [<script>]
        build-script config [<setting> [<value>]] | config --unset <setting>
 build, run and test take --jobs <n>, the number of modules built at the same time";
 
@@ -50,6 +51,10 @@ enum Command {
         name: String,
         script: String,
         package: Option<String>,
+    },
+    /// removes the build directories of the script's modules
+    Clean {
+        script: String,
     },
     /// shows the settings, one of them, sets or removes one
     Config {
@@ -91,6 +96,11 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 script: script_or_default(&positional)?,
                 module,
                 args: program_args,
+            });
+        }
+        "clean" => {
+            return Ok(Command::Clean {
+                script: script_or_default(rest)?,
             });
         }
         "test" => {
@@ -193,6 +203,8 @@ fn help() -> String {
           Android app, or the one --module names; arguments after -- go to the program
   test    builds, then compiles and runs the tests of every module, or of one; failing
           tests do not stop the others, a summary of all of them follows
+  clean   removes the build directories build-script wrote below the script's
+          directory, the downloads stay
   new     creates a project in a new directory: {}
   add     adds a module in a directory next to the script and its build call to the
           script: {}
@@ -262,6 +274,10 @@ fn main() {
             unset,
         } => {
             exit_on_error(config(setting.as_deref(), value.as_deref(), *unset));
+            return;
+        }
+        Command::Clean { script } => {
+            exit_on_error(project::clean(Path::new(script)));
             return;
         }
         Command::Build { script } | Command::Run { script, .. } | Command::Test { script, .. } => {
@@ -635,6 +651,12 @@ mod tests {
             })
         );
         assert!(parse(&["config", "a", "b", "c"]).is_err());
+        assert_eq!(
+            parse(&["clean"]),
+            Ok(Command::Clean {
+                script: DEFAULT_SCRIPT.to_string()
+            })
+        );
         assert_eq!(
             parse(&["app/project.build"]),
             Ok(Command::Build {
