@@ -1,0 +1,20 @@
+// Compiler plugins without a short name: Kotlin's power-assert and Poko from another publisher
+use kotlin
+
+repositories = list(maven_central())
+
+build_kotlin(
+    "compiler-plugins",
+    list("dev.drewhamilton.poko:poko-annotations:0.23.2"),
+    repositories,
+    main_class = "MainKt",
+    plugins = list(
+        // one of Kotlin's own plugins, the version comes from the compiler
+        "org.jetbrains.kotlin:kotlin-power-assert-compiler-plugin-embeddable",
+        "dev.drewhamilton.poko:poko-compiler-plugin:0.23.2",
+    ),
+    plugin_options = list(
+        "plugin:org.jetbrains.kotlin.powerassert:function=kotlin.require",
+        "plugin:dev.drewhamilton.poko:enabled=true",
+    ),
+)

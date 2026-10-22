@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package greeting;
+
+message Greeting {
+  string name = 1;
+  int32 times = 2;
+}

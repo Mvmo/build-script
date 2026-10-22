@@ -1,0 +1,19 @@
+use kotlin
+
+dependencies = list(
+    "com.google.code.gson:gson:2.11.0",
+    "org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.10.2",
+)
+
+repositories = list(maven_local(), maven_central())
+
+java = jdk("21", distribution = "temurin")
+
+app = build_kotlin(
+    "kotlin-app",
+    dependencies,
+    repositories,
+    main_class = "MainKt",
+    jdk = java,
+)
+

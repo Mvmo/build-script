@@ -1,0 +1,19 @@
+use kotlin
+
+repositories = list(maven_central())
+
+core = build_kotlin(
+    "core",
+    list("com.google.code.gson:gson:2.11.0"),
+    repositories,
+    directory = "core",
+)
+
+app = build_kotlin(
+    "app",
+    list(core),
+    repositories,
+    main_class = "AppKt",
+    directory = "app",
+)
+

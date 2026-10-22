@@ -1,0 +1,28 @@
+use kotlin
+use android
+
+repositories = list(google(), maven_central())
+
+shared = build_kotlin("shared", list(), repositories, directory = "shared")
+
+greeting = build_android_library(
+    "greeting",
+    "com.example.greeting",
+    list("androidx.core:core-ktx:1.13.1"),
+    repositories,
+    directory = "greeting",
+)
+
+app = build_android(
+    "app",
+    "com.example.app",
+    list(greeting, shared, "androidx.appcompat:appcompat:1.7.0"),
+    repositories,
+    application_id = "com.example.buildscript",
+    min_sdk = 24,
+    version_code = 3,
+    version_name = "1.2",
+    directory = "app",
+)
+
+print("APK:", app)

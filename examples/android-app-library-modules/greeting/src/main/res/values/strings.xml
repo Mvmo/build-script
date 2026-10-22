@@ -1,0 +1,3 @@
+<resources>
+    <string name="greeting_text">Hello from the greeting library</string>
+</resources>

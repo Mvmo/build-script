@@ -1,0 +1,21 @@
+// Protobuf messages to Kotlin with Wire, a code generator that has a command line
+use kotlin
+
+repositories = list(maven_central())
+
+protos = generate_sources(
+    "wire",
+    tool = list("com.squareup.wire:wire-compiler:7.1.0"),
+    repositories,
+    main_class = "com.squareup.wire.WireCompiler",
+    args = list("--proto_path=src/main/proto", "--kotlin_out={output}"),
+    inputs = list("src/main/proto"),
+)
+
+build_kotlin(
+    "codegen-wire",
+    list("com.squareup.wire:wire-runtime:7.1.0"),
+    repositories,
+    main_class = "MainKt",
+    generated_sources = list(protos),
+)

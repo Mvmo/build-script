@@ -1,0 +1,41 @@
+// Code generated from annotations: javac processors and Kotlin symbol processors (KSP)
+use kotlin
+use android
+
+repositories = list(maven_central())
+
+// Dagger generates DaggerMain_AppComponent with javac, like annotationProcessor(...) in Gradle
+build_kotlin(
+    "dagger",
+    list("com.google.dagger:dagger:2.60.1"),
+    repositories,
+    main_class = "app.Main",
+    annotation_processors = list("com.google.dagger:dagger-compiler:2.60.1"),
+    directory = "dagger",
+    test_dependencies = list("org.junit.jupiter:junit-jupiter-api:5.14.4"),
+    // the test has a component of its own, like testAnnotationProcessor(...) in Gradle
+    test_annotation_processors = list("com.google.dagger:dagger-compiler:2.60.1"),
+)
+
+// Moshi generates GreetingJsonAdapter with KSP, like ksp(...) in Gradle
+build_kotlin(
+    "moshi",
+    list("com.squareup.moshi:moshi:1.15.2"),
+    repositories,
+    main_class = "MainKt",
+    ksp = list("com.squareup.moshi:moshi-kotlin-codegen:1.15.2"),
+    directory = "moshi",
+    test_dependencies = list("org.jetbrains.kotlin:kotlin-test"),
+    // the tests have JSON classes of their own, like kspTest(...) in Gradle
+    test_ksp = list("com.squareup.moshi:moshi-kotlin-codegen:1.15.2"),
+)
+
+// Room generates NoteDatabase_Impl with KSP for Android, against android.jar instead of a JDK
+build_android(
+    "room",
+    "com.example.room",
+    list("androidx.room:room-runtime:2.8.5"),
+    list(google(), maven_central()),
+    ksp = list("androidx.room:room-compiler:2.8.5"),
+    directory = "room",
+)

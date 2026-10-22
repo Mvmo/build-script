@@ -1,0 +1,28 @@
+use android
+
+repositories = list(google(), maven_central())
+
+compose = build_android(
+    "compose-app",
+    "com.example.compose",
+    list(
+        "androidx.activity:activity-compose:1.9.3",
+        "androidx.compose.material3:material3:1.3.1",
+        "androidx.compose.ui:ui:1.7.5",
+        "org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3",
+    ),
+    repositories,
+    plugins = list("compose", "parcelize", "serialization"),
+    build_config_fields = list("String GREETING Hello from Compose", "int ANSWER 42"),
+    directory = "compose-app",
+)
+
+views = build_android(
+    "views-app",
+    "com.example.views",
+    list("androidx.appcompat:appcompat:1.7.0"),
+    repositories,
+    view_binding = true,
+    build_config_fields = list("String API_URL https://example.com/api"),
+    directory = "views-app",
+)
