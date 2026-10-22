@@ -58,7 +58,7 @@ pub struct Runtime {
 /// The platforms of every language category
 const PLATFORMS: &[&[Platform]] = &[jvm::PLATFORMS];
 
-/// Without conditions in the language a function that calls itself never ends, this catches it
+/// A function that calls itself without an if that ends it never returns, this catches it
 const MAX_CALL_DEPTH: usize = 64;
 
 /// Every name a script has without defining it: true and false, the core
@@ -214,6 +214,22 @@ impl Runtime {
                 return Self::evaluate_unary(operator, value, span);
             }
 
+            // the right side only runs when the left one does not decide
+            ExpressionType::Binary {
+                left,
+                operator: operator @ (BinaryOperator::And | BinaryOperator::Or),
+                right,
+            } => {
+                let what = if matches!(operator, BinaryOperator::And) { "&&" } else { "||" };
+                let left = self.evaluate_bool(left, what)?;
+
+                if left == matches!(operator, BinaryOperator::Or) {
+                    return Ok(Value::Bool(left));
+                }
+
+                return Ok(Value::Bool(self.evaluate_bool(right, what)?));
+            }
+
             ExpressionType::Binary {
                 left,
                 operator,
@@ -223,6 +239,22 @@ impl Runtime {
                 let right = self.evaluate(right)?;
 
                 return Self::evaluate_binary(operator, left, right, span);
+            }
+
+            ExpressionType::If {
+                condition,
+                then,
+                otherwise,
+            } => {
+                let block = match self.evaluate_bool(condition, "the condition of an if")? {
+                    true => Some(then),
+                    false => otherwise.as_ref(),
+                };
+
+                return match block {
+                    Some(block) => self.evaluate_block(block),
+                    None => Ok(Value::Unit),
+                };
             }
 
             ExpressionType::FunctionCall { target, args } => {
@@ -250,6 +282,36 @@ impl Runtime {
                 return self.call(callee, arguments, span);
             }
         }
+    }
+
+    fn evaluate_bool(&mut self, expression: &Expression, what: &'static str) -> Result<bool, RuntimeError> {
+        match self.evaluate(expression)? {
+            Value::Bool(bool) => return Ok(bool),
+            other => {
+                return Err(RuntimeError::new(
+                    RuntimeErrorType::NotBool { what, got: other.type_of() },
+                    expression.span,
+                ));
+            }
+        }
+    }
+
+    /// In a scope below this one, like a function body: its value is the last expression's
+    fn evaluate_block(&mut self, block: &[Expression]) -> Result<Value, RuntimeError> {
+        let scope = Scope::child(&self.scope);
+        let outer_scope = std::mem::replace(&mut self.scope, scope);
+        let mut result = Ok(Value::Unit);
+
+        for expression in block {
+            result = self.evaluate(expression);
+            if result.is_err() {
+                break;
+            }
+        }
+
+        self.scope = outer_scope;
+
+        return result;
     }
 
     fn evaluate_unary(
@@ -315,6 +377,34 @@ impl Runtime {
                         span,
                     )
                 });
+            }
+
+            (
+                BinaryOperator::Less
+                | BinaryOperator::LessEq
+                | BinaryOperator::Greater
+                | BinaryOperator::GreaterEq,
+                _,
+                _,
+            ) => {
+                let ordering = match (&left, &right) {
+                    (Value::Int(l), Value::Int(r)) => l.cmp(r),
+                    (Value::String(l), Value::String(r)) => l.cmp(r),
+                    _ => {
+                        return Err(RuntimeError::invalid_binary_operands(
+                            operator, &left, &right, span,
+                        ));
+                    }
+                };
+
+                let holds = match operator {
+                    BinaryOperator::Less => ordering.is_lt(),
+                    BinaryOperator::LessEq => ordering.is_le(),
+                    BinaryOperator::Greater => ordering.is_gt(),
+                    _ => ordering.is_ge(),
+                };
+
+                return Ok(Value::Bool(holds));
             }
 
             (BinaryOperator::Eq | BinaryOperator::NotEq, _, _) => {
@@ -645,6 +735,37 @@ fn core_functions() -> Vec<(&'static str, Value)> {
             ),
         ),
         (
+            "env",
+            builtin(
+                "env",
+                FunctionParams::new()
+                    .required("name", Type::String)
+                    .optional("default", Type::String)
+                    .returns(Type::String),
+                |_, args| {
+                    let name: String = args.get("name")?;
+
+                    if let Ok(value) = std::env::var(&name) {
+                        return Ok(value.into());
+                    }
+
+                    return args.get::<Option<String>>("default")?.map(Value::from).ok_or_else(|| {
+                        format!("the environment variable {name} is not set, a default = ... would be taken then")
+                    });
+                },
+            ),
+        ),
+        (
+            "has_env",
+            builtin(
+                "has_env",
+                FunctionParams::new()
+                    .required("name", Type::String)
+                    .returns(Type::Bool),
+                |_, args| Ok(Value::Bool(std::env::var_os(args.get::<String>("name")?).is_some())),
+            ),
+        ),
+        (
             "current_time_millis",
             builtin(
                 "current_time_millis",
@@ -705,6 +826,59 @@ mod tests {
 
     fn string(runtime: &Runtime, name: &str) -> String {
         return variable(runtime, name).to_string();
+    }
+
+    #[test]
+    fn conditions_choose_their_block() {
+        let runtime = run(r#"
+            ci = "true"
+            jdk = if ci == "true" { "21" } else { "17" }
+            size = if 3 > 5 { "big" } else if 3 >= 3 { "same" } else { "small" }
+            nothing = if false { "x" }
+            both = 1 < 2 && "a" <= "b" || false
+            pick = fn (ci: bool) -> str { if ci { "ci" } else { "local" } }
+            local = pick(false)
+        "#)
+        .unwrap();
+
+        assert_eq!(string(&runtime, "jdk"), "21");
+        assert_eq!(string(&runtime, "size"), "same");
+        assert!(matches!(variable(&runtime, "nothing"), Value::Unit));
+        assert_eq!(string(&runtime, "both"), "true");
+        assert_eq!(string(&runtime, "local"), "local");
+
+        // the right side only runs when the left one does not decide
+        assert!(run("x = false && undefined").is_ok());
+        assert!(run("x = true || undefined").is_ok());
+
+        let error = run(r#"x = if "yes" { 1 }"#).err().unwrap();
+        assert_eq!(error.to_string(), "the condition of an if must be bool, got str");
+        assert_eq!(run("x = 1 && true").err().unwrap().to_string(), "&& must be bool, got int");
+        assert!(matches!(
+            run(r#"x = 1 < "2""#).err().unwrap().variant,
+            RuntimeErrorType::InvalidBinaryOperands { .. }
+        ));
+
+        // what a block defines stays in it
+        let error = run("if true { inner = 1 }\ny = inner").err().unwrap();
+        assert!(matches!(error.variant, RuntimeErrorType::UndefinedVariable { .. }));
+    }
+
+    #[test]
+    fn environment_variables_with_a_default() {
+        let runtime = run(r#"
+            home = env("HOME")
+            missing = env("BUILD_SCRIPT_SURELY_NOT_SET", default = "fallback")
+            has = has_env("HOME") && !has_env("BUILD_SCRIPT_SURELY_NOT_SET")
+        "#)
+        .unwrap();
+
+        assert_eq!(string(&runtime, "home"), std::env::var("HOME").unwrap());
+        assert_eq!(string(&runtime, "missing"), "fallback");
+        assert_eq!(string(&runtime, "has"), "true");
+
+        let error = run(r#"x = env("BUILD_SCRIPT_SURELY_NOT_SET")"#).err().unwrap();
+        assert!(error.to_string().contains("BUILD_SCRIPT_SURELY_NOT_SET is not set"), "{error}");
     }
 
     /// A JVM library that cannot be started

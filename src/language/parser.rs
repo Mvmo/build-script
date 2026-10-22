@@ -106,6 +106,12 @@ pub enum BinaryOperator {
     Div,
     Eq,
     NotEq,
+    Less,
+    LessEq,
+    Greater,
+    GreaterEq,
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +140,13 @@ pub enum ExpressionType {
         params: Vec<Parameter>,
         returns: Option<TypeExpression>,
         body: Vec<Expression>,
+    },
+    /// if condition { ... } else { ... }, the value of the block that runs;
+    /// `else if` is an else block with one if in it
+    If {
+        condition: Box<Expression>,
+        then: Vec<Expression>,
+        otherwise: Option<Vec<Expression>>,
     },
 }
 
@@ -210,16 +223,19 @@ pub struct Script {
     pub statements: Vec<Statement>,
 }
 
-const PREFIX_PRECEDENCE: u8 = 9; // -x, !x
-const CALL_PRECEDENCE: u8 = 11; // f(x)
+const PREFIX_PRECEDENCE: u8 = 15; // -x, !x
+const CALL_PRECEDENCE: u8 = 17; // f(x)
 const NO_ASSIGNMENT_PRECEDENCE: u8 = 3; // everything binding tighter than =, for defaults
 
 const fn infix_precedence(variant: &TokenType) -> Option<(u8, u8)> {
     return Some(match variant {
         TokenType::Eq => (2, 1),
-        TokenType::EqEq | TokenType::BangEq => (3, 4),
-        TokenType::Plus | TokenType::Minus => (5, 6),
-        TokenType::Star | TokenType::Slash => (7, 8),
+        TokenType::PipePipe => (3, 4),
+        TokenType::AmpAmp => (5, 6),
+        TokenType::EqEq | TokenType::BangEq => (7, 8),
+        TokenType::Less | TokenType::LessEq | TokenType::Greater | TokenType::GreaterEq => (9, 10),
+        TokenType::Plus | TokenType::Minus => (11, 12),
+        TokenType::Star | TokenType::Slash => (13, 14),
         _ => return None,
     });
 }
@@ -335,6 +351,7 @@ impl<'src> Parser<'src> {
                 });
             }
             TokenType::Fn => return self.parse_function(span),
+            TokenType::If => return self.parse_if(span),
             TokenType::Minus => return self.parse_unary_expression(UnaryOperator::Neg, span),
             TokenType::Bang => return self.parse_unary_expression(UnaryOperator::Not, span),
             TokenType::LeftParen => {
@@ -396,6 +413,53 @@ impl<'src> Parser<'src> {
             _ => None,
         };
 
+        let (body, close) = self.parse_block()?;
+
+        return Ok(Expression {
+            variant: ExpressionType::Function {
+                params,
+                returns,
+                body,
+            },
+            span: fn_span.till(close),
+        });
+    }
+
+    fn parse_if(&mut self, if_span: Span) -> Result<Expression, ParseError> {
+        let condition = self.parse_expression(0)?;
+        let (then, mut close) = self.parse_block()?;
+
+        let otherwise = match self.token_stream.peek().variant {
+            TokenType::Else => {
+                self.token_stream.eat_next();
+                let else_token = self.token_stream.peek();
+
+                if else_token.variant == TokenType::If {
+                    self.token_stream.eat_next();
+                    let nested = self.parse_if(else_token.span)?;
+                    close = nested.span;
+                    Some(vec![nested])
+                } else {
+                    let (block, block_close) = self.parse_block()?;
+                    close = block_close;
+                    Some(block)
+                }
+            }
+            _ => None,
+        };
+
+        return Ok(Expression {
+            variant: ExpressionType::If {
+                condition: Box::new(condition),
+                then,
+                otherwise,
+            },
+            span: if_span.till(close),
+        });
+    }
+
+    /// `{ expressions }`, with the span of the closing brace
+    fn parse_block(&mut self) -> Result<(Vec<Expression>, Span), ParseError> {
         expect_token!(self, TokenType::LeftBrace)?;
         let mut body = vec![];
 
@@ -408,14 +472,7 @@ impl<'src> Parser<'src> {
 
         let close = expect_token!(self, TokenType::RightBrace)?;
 
-        return Ok(Expression {
-            variant: ExpressionType::Function {
-                params,
-                returns,
-                body,
-            },
-            span: fn_span.till(close.span),
-        });
+        return Ok((body, close.span));
     }
 
     /// A type, members of a union separated by |
@@ -569,6 +626,12 @@ impl<'src> Parser<'src> {
             TokenType::Minus => BinaryOperator::Sub,
             TokenType::Star => BinaryOperator::Mul,
             TokenType::Slash => BinaryOperator::Div,
+            TokenType::Less => BinaryOperator::Less,
+            TokenType::LessEq => BinaryOperator::LessEq,
+            TokenType::Greater => BinaryOperator::Greater,
+            TokenType::GreaterEq => BinaryOperator::GreaterEq,
+            TokenType::AmpAmp => BinaryOperator::And,
+            TokenType::PipePipe => BinaryOperator::Or,
             other => unreachable!("{other:?} is no binary expression"),
         };
 

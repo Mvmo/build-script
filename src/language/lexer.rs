@@ -9,7 +9,7 @@ impl Span {
         return Span::new(self.start, end.end);
     }
 
-    fn new(start: usize, end: usize) -> Self {
+    pub fn new(start: usize, end: usize) -> Self {
         return Span { start, end };
     }
 }
@@ -31,6 +31,8 @@ pub enum TokenType {
     // Keywords
     Use,
     Fn,
+    If,
+    Else,
 
     // Operators
     EqEq,
@@ -41,6 +43,10 @@ pub enum TokenType {
     Star,
     Slash,
     Bang,
+    AmpAmp,
+    PipePipe,
+    LessEq,
+    GreaterEq,
 
     // Parens
     LeftParen,
@@ -67,6 +73,8 @@ impl ToString for TokenType {
         return String::from(match self {
             TokenType::Use => "use",
             TokenType::Fn => "fn",
+            TokenType::If => "if",
+            TokenType::Else => "else",
             TokenType::EqEq => "==",
             TokenType::BangEq => "!=",
             TokenType::Eq => "=",
@@ -75,6 +83,10 @@ impl ToString for TokenType {
             TokenType::Star => "*",
             TokenType::Slash => "/",
             TokenType::Bang => "!",
+            TokenType::AmpAmp => "&&",
+            TokenType::PipePipe => "||",
+            TokenType::LessEq => "<=",
+            TokenType::GreaterEq => ">=",
             TokenType::LeftParen => "(",
             TokenType::RightParen => ")",
             TokenType::LeftBrace => "{",
@@ -100,9 +112,13 @@ const CONTROL_SYMBOLS: &[(&'static str, TokenType)] = &[
     ("}", TokenType::RightBrace),
     (",", TokenType::Comma),
     (":", TokenType::Colon),
+    ("<=", TokenType::LessEq),
     ("<", TokenType::Less),
+    (">=", TokenType::GreaterEq),
     (">", TokenType::Greater),
+    ("||", TokenType::PipePipe),
     ("|", TokenType::Pipe),
+    ("&&", TokenType::AmpAmp),
     ("==", TokenType::EqEq),
     ("!=", TokenType::BangEq),
     ("=", TokenType::Eq),
@@ -128,7 +144,12 @@ const fn control_chars() -> [char; CONTROL_SYMBOLS.len()] {
 
 const CONTROL_CHARS: [char; CONTROL_SYMBOLS.len()] = control_chars();
 
-const KEYWORDS: &[(&'static str, TokenType)] = &[("use", TokenType::Use), ("fn", TokenType::Fn)];
+const KEYWORDS: &[(&'static str, TokenType)] = &[
+    ("use", TokenType::Use),
+    ("fn", TokenType::Fn),
+    ("if", TokenType::If),
+    ("else", TokenType::Else),
+];
 
 pub struct TokenStream<'src> {
     pub input: &'src str,
@@ -178,6 +199,13 @@ impl<'src> TokenStream<'src> {
         let maybe_ident_len = trimmed
             .find(|char: char| char.is_whitespace() || char == '"' || CONTROL_CHARS.contains(&char))
             .unwrap_or_else(|| trimmed.len());
+
+        // a character that only starts a symbol, like a single &: one token, so the parser can name it
+        let maybe_ident_len = if maybe_ident_len == 0 {
+            first_char.len_utf8()
+        } else {
+            maybe_ident_len
+        };
 
         let maybe_ident = &trimmed[..maybe_ident_len];
         current_pos += maybe_ident_len;
