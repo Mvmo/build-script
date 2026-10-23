@@ -1,0 +1,14 @@
+use kotlin
+
+// one jar with gson and the coroutines inside, gson moved to a package of its own
+app = build_kotlin(
+    "fat-jar-app",
+    list(
+        "com.google.code.gson:gson:2.11.0",
+        "org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.10.2",
+    ),
+    list(maven_central()),
+    main_class = "MainKt",
+    fat_jar = true,
+    relocate = list("com.google.gson=example.libs.gson"),
+)

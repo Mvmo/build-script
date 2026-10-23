@@ -1,4 +1,5 @@
-// build_kotlin and build_java: modules for the JVM, a jar with its libraries next to it, and their unit tests
+// build_kotlin and build_java: modules for the JVM, a jar with its libraries next to it or inside
+// as a fat jar, and their unit tests
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,7 @@ use crate::language::runtime::{
 };
 
 use super::JvmLaunch;
+use super::jar_merge::{self, JarContents};
 use super::maven::TargetPlatform;
 use super::module::{
     Compilation, ModuleBuildInputs, Sources, classes_kind, create_jar, dependencies_type,
@@ -45,7 +47,11 @@ fn jar_parameters(sources: Sources) -> FunctionSignature {
                 .required("name", Type::String)
                 .required("dependencies", dependencies_type())
                 .required("repositories", Type::list(Type::String))
-                .optional("main_class", Type::String),
+                .optional("main_class", Type::String)
+                // one jar with the libraries inside, like the shadow plugin of Gradle
+                .with_default("fat_jar", Type::Bool, false)
+                // "from=to": packages of the libraries moved inside the fat jar
+                .with_default("relocate", Type::list(Type::String), Value::string_list(&[])),
             &["main"],
             sources,
         ),
@@ -54,7 +60,8 @@ fn jar_parameters(sources: Sources) -> FunctionSignature {
     .returns(Type::Module);
 }
 
-/// build/libs/<name>.jar, its runtime libraries in build/libs/lib
+/// build/libs/<name>.jar with its runtime libraries in build/libs/lib, or with
+/// fat_jar = true build/libs/<name>-all.jar with the libraries inside
 fn build_module(
     context: &BuildScriptContext,
     args: &Arguments,
@@ -72,7 +79,7 @@ fn build_module(
     }
 
     let main_class = args.get::<Option<String>>("main_class")?;
-    let jar = build_jar(&inputs, args, main_class.as_deref())?;
+    let (jar, artifact) = build_jar(&inputs, args, main_class.as_deref())?;
 
     let unit_tests = UnitTests {
         inputs: &inputs,
@@ -95,19 +102,20 @@ fn build_module(
     });
 
     return Ok(Value::from(inputs.built_module(
-        Some(jar.clone()),
+        Some(jar),
         None,
-        jar,
+        artifact,
         launch,
         tests,
     )));
 }
 
+/// The jar of the module and the artifact: the fat jar with fat_jar = true, else that jar
 fn build_jar(
     inputs: &ModuleBuildInputs,
     args: &Arguments,
     main_class: Option<&str>,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, PathBuf), String> {
     let build_dir = inputs.directory.join("build");
     let resources_dir = build_dir.join("resources/main");
 
@@ -118,6 +126,28 @@ fn build_jar(
 
     let libs_dir = build_dir.join("libs");
     let jar = libs_dir.join(format!("{}.jar", inputs.name));
+
+    let fat_jar = args.get::<bool>("fat_jar")?;
+
+    let mut relocations = vec![];
+    for (from, to) in args.assignments("relocate")? {
+        let to = to.trim().to_string();
+
+        if from.is_empty() || to.is_empty() {
+            return Err(format!("relocate: '{from}={to}' needs a package on both sides"));
+        }
+
+        relocations.push((from, to));
+    }
+
+    if !relocations.is_empty() && !fat_jar {
+        return Err("relocate moves packages inside a fat jar, it needs fat_jar = true".to_string());
+    }
+
+    let artifact = match fat_jar {
+        true => libs_dir.join(format!("{}-all.jar", inputs.name)),
+        false => jar.clone(),
+    };
 
     let (kotlin_sources, java_sources) = kotlin_and_java_sources(&inputs.source_dirs);
 
@@ -139,8 +169,8 @@ fn build_jar(
 
     let fingerprint = inputs.input_fingerprint(&inputs.name, args, &inputs.resources.inputs())?;
 
-    if inputs.is_up_to_date(&fingerprint, &[&jar])? {
-        return Ok(jar);
+    if inputs.is_up_to_date(&fingerprint, &[&jar, &artifact])? {
+        return Ok((jar, artifact));
     }
 
     system::log(&inputs.name, &format!("JDK {}", inputs.jdk.home.display()));
@@ -185,9 +215,17 @@ fn build_jar(
         .resources
         .process(&generated_resources, &resources_dir)?;
 
-    let libraries = copy_to_lib_dir(&classpath, &libs_dir.join("lib"))?;
+    // a fat jar has the libraries inside
+    let libraries = match fat_jar {
+        true => {
+            system::remove_dir(&libs_dir.join("lib"))?;
+            vec![]
+        }
+        false => copy_to_lib_dir(&classpath, &libs_dir.join("lib"))?,
+    };
+
     let manifest_file = build_dir.join("tmp/jar/MANIFEST.MF");
-    system::write_file(&manifest_file, &jar_manifest(main_class, &libraries))?;
+    system::write_file(&manifest_file, &jar_manifest(main_class, &libraries, false))?;
     create_jar(
         &inputs.jdk,
         &jar,
@@ -195,9 +233,70 @@ fn build_jar(
         &[&classes_dir, &resources_dir],
     )?;
 
-    inputs.finish(&fingerprint, &jar)?;
+    if fat_jar {
+        // the module first, then the modules and libraries it needs at runtime
+        let mut jars = vec![jar.clone()];
+        jars.extend(
+            resolved
+                .modules
+                .iter()
+                .filter_map(|module| module.jvm().classes.clone()),
+        );
+        jars.extend(resolved.libraries.iter().cloned());
 
-    return Ok(jar);
+        build_fat_jar(inputs, &jars, main_class, &relocations, &artifact)?;
+    }
+
+    inputs.finish(&fingerprint, &artifact)?;
+
+    return Ok((jar, artifact));
+}
+
+/// The jars merged into `output`, the packages of `relocations` (from, to) moved
+fn build_fat_jar(
+    inputs: &ModuleBuildInputs,
+    jars: &[PathBuf],
+    main_class: Option<&str>,
+    relocations: &[(String, String)],
+    output: &Path,
+) -> Result<(), String> {
+    let work_dir = inputs.directory.join("build/tmp/fat-jar");
+    let contents = work_dir.join("contents");
+
+    system::log(&inputs.name, &format!("Fat jar of {} jars", jars.len()));
+
+    let differing_classes = jar_merge::merge_jars(
+        jars,
+        JarContents::ClassesAndResources,
+        &contents,
+        &work_dir.join("scratch"),
+    )?;
+
+    if differing_classes > 0 {
+        let message = format!("{differing_classes} classes are in several jars, the first counts");
+        system::log(&inputs.name, &message);
+    }
+
+    // META-INF/versions only counts in multi-release jars
+    let multi_release = contents.join("META-INF/versions").is_dir();
+    let manifest_file = work_dir.join("MANIFEST.MF");
+    system::write_file(&manifest_file, &jar_manifest(main_class, &[], multi_release))?;
+
+    if relocations.is_empty() {
+        return create_jar(&inputs.jdk, output, Some(&manifest_file), &[&contents]);
+    }
+
+    system::log(
+        &inputs.name,
+        &format!("Relocating {} package(s) with jar-relocator", relocations.len()),
+    );
+
+    jar_merge::relocate_service_files(&contents, relocations)?;
+
+    let unrelocated = work_dir.join("unrelocated.jar");
+    create_jar(&inputs.jdk, &unrelocated, Some(&manifest_file), &[&contents])?;
+
+    return jar_merge::relocate(inputs, &unrelocated, output, relocations);
 }
 
 /// Returns their file names for the Class-Path
@@ -226,12 +325,16 @@ fn copy_to_lib_dir(jars: &[PathBuf], lib_dir: &Path) -> Result<Vec<String>, Stri
     return Ok(names);
 }
 
-fn jar_manifest(main_class: Option<&str>, libraries: &[String]) -> String {
+fn jar_manifest(main_class: Option<&str>, libraries: &[String], multi_release: bool) -> String {
     let mut manifest = manifest_line("Manifest-Version", "1.0");
     manifest += &manifest_line("Created-By", "build-script");
 
     if let Some(main_class) = main_class {
         manifest += &manifest_line("Main-Class", main_class);
+    }
+
+    if multi_release {
+        manifest += &manifest_line("Multi-Release", "true");
     }
 
     if !libraries.is_empty() {

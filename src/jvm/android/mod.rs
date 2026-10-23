@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::common::system;
 use crate::common::xml::{self, XmlElement};
 use crate::jvm::JvmLaunch;
+use crate::jvm::jar_merge::{JarContents, merge_jars};
 use crate::jvm::maven::{MavenCoordinate, TargetPlatform};
 use crate::jvm::module::{
     Dependencies, ModuleBuildInputs, Sources, dependencies_type, kotlin_and_java_sources,
@@ -23,7 +24,7 @@ use crate::language::runtime::{
 
 use build::{
     AndroidBuild, DEFAULT_NDK_VERSION, LinkedResources, android_input_paths, existing_dirs,
-    merge_java_resources, native_library_dirs, read_android_inputs,
+    native_library_dirs, read_android_inputs,
 };
 use device::InstrumentedTests;
 use generated::SymbolTable;
@@ -525,8 +526,9 @@ impl Apk<'_> {
 
         resource_jars.extend(own_jars.iter().chain(&build.jars).cloned());
         let java_resources = intermediates.join("java-resources");
-        merge_java_resources(
+        merge_jars(
             &resource_jars,
+            JarContents::JavaResources,
             &java_resources,
             &intermediates.join("java-resources.tmp"),
         )?;
