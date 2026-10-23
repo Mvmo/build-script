@@ -3,6 +3,7 @@ pub mod android;
 mod generator;
 pub mod install;
 mod jar;
+mod jar_merge;
 mod jdk;
 mod ksp;
 pub mod maven;
