@@ -141,11 +141,13 @@ pub fn remove_entries_marked_for_removal(element: &mut XmlElement) {
 }
 
 fn merge_child(parent: &mut XmlElement, child: &XmlElement) {
-    match parent
-        .children
-        .iter_mut()
-        .find(|existing| is_same_entry(existing, child))
-    {
+    // tag and android:name identify an entry
+    let same_entry = |existing: &&mut XmlElement| {
+        existing.name == child.name
+            && existing.attribute("android:name") == child.attribute("android:name")
+    };
+
+    match parent.children.iter_mut().find(same_entry) {
         // the app removes this entry on purpose
         Some(existing) if existing.attribute("tools:node") == Some("remove") => {}
         // unnamed entries like <intent-filter> are only added when new
@@ -186,12 +188,6 @@ fn same_content(left: &XmlElement, right: &XmlElement) -> bool {
             .iter()
             .zip(&right.children)
             .all(|(left, right)| same_content(left, right));
-}
-
-/// Tag and android:name identify an entry for merging
-fn is_same_entry(left: &XmlElement, right: &XmlElement) -> bool {
-    return left.name == right.name
-        && left.attribute("android:name") == right.attribute("android:name");
 }
 
 #[cfg(test)]

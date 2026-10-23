@@ -39,6 +39,8 @@ pub const DEFAULT_BUILD_TOOLS: &str = "36.1.0";
 const DEFAULT_TEST_RUNNER: &str = "androidx.test.runner.AndroidJUnitRunner";
 /// added to the instrumented tests when they use the default runner without naming it
 const DEFAULT_TEST_RUNNER_LIBRARY: &str = "androidx.test:runner:1.6.2";
+/// R.txt of a library module, what apps write its R class from
+const LIBRARY_SYMBOL_FILE: &str = "build/intermediates/R.txt";
 
 /// What consumers of an Android library need besides its classes
 #[derive(Debug, Hash)]
@@ -100,10 +102,10 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
 
 /// Those of build_kotlin and those of Android modules. Debug builds: the debug
 /// source set lies over main, like with the Gradle plugin.
-fn android_parameters(params: FunctionParameters) -> FunctionSignature {
+fn android_parameters(parameters: FunctionParameters) -> FunctionSignature {
     let source_sets = &["main", "debug"];
     return unit_test_parameters(
-        module_parameters(params, source_sets, Sources::KotlinAndJava),
+        module_parameters(parameters, source_sets, Sources::KotlinAndJava),
         Sources::KotlinAndJava,
     )
     // "name=value" for ${name} in the manifests
@@ -200,13 +202,13 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
             (build.inputs, build.sdk, merged_manifest)
         };
 
-    let launch = app_launch(
-        &sdk,
-        settings.application_id.clone(),
-        &merged_manifest,
-        &namespace,
-        args.get("min_sdk")?,
-    );
+    // installed, then its launcher activity started
+    let launch = JvmLaunch::Apk {
+        sdk_root: sdk.root.clone(),
+        application_id: settings.application_id.clone(),
+        activity: launcher_activity(&merged_manifest, &namespace),
+        min_sdk: args.get("min_sdk")?,
+    };
 
     // the app's classes, its R and BuildConfig, its Java resources
     let intermediates = build_dir.join("intermediates");
@@ -246,7 +248,7 @@ fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Resu
         namespace: namespace.clone(),
         res_dirs: existing_dirs(&inputs, args, "res_dirs")?,
         manifest: source_manifest.clone(),
-        symbols: Some(library_symbol_file(&inputs)),
+        symbols: Some(inputs.directory.join(LIBRARY_SYMBOL_FILE)),
         asset_dirs: existing_dirs(&inputs, args, "asset_dirs")?,
         native_library_dirs: native_library_dirs(&inputs, args)?,
         view_binding: args.get("view_binding")?,
@@ -278,7 +280,7 @@ fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Resu
         // R with non-final ids only to compile against, apps generate the real one
         system::log(&build.inputs.name, "Linking resources");
         let own_resources = build.compile_own_resources()?;
-        let symbols = library_symbol_file(&build.inputs);
+        let symbols = build.inputs.directory.join(LIBRARY_SYMBOL_FILE);
         build.link_library(&manifest, &own_resources, &intermediates, &symbols)?;
         let r_classes = intermediates.join("classes/r");
         build.compile_generated_java(
@@ -544,22 +546,6 @@ impl Apk<'_> {
     }
 }
 
-/// How `build-script run` starts the app: installed, then its launcher activity
-fn app_launch(
-    sdk: &AndroidSdk,
-    application_id: String,
-    merged_manifest: &XmlElement,
-    namespace: &str,
-    min_sdk: i64,
-) -> JvmLaunch {
-    return JvmLaunch::Apk {
-        sdk_root: sdk.root.clone(),
-        application_id,
-        activity: launcher_activity(merged_manifest, namespace),
-        min_sdk,
-    };
-}
-
 fn android_sdk(args: &Arguments) -> Result<AndroidSdk, String> {
     return AndroidSdk::ensure(
         args.get("compile_sdk")?,
@@ -742,9 +728,4 @@ fn test_manifest(
     });
 
     return Ok(manifest);
-}
-
-/// R.txt of a library module, what apps write its R class from
-fn library_symbol_file(inputs: &ModuleBuildInputs) -> PathBuf {
-    return inputs.directory.join("build/intermediates/R.txt");
 }

@@ -241,10 +241,10 @@ fn start_or_set_up_emulator(adb: &Path, sdk_root: &Path, min_sdk: i64) -> Result
     println!("\nNo Android device or emulator is connected.");
     // AVDs live in the build home instead of ~/.android/avd
     let home = system::data_dir("android/avd");
-    let avds = list_avds(&home);
+    let avds = list_virtual_devices(&home);
 
     let name = if avds.is_empty() {
-        set_up_avd(sdk_root, &home, min_sdk)?
+        set_up_virtual_device(sdk_root, &home, min_sdk)?
     } else {
         println!("\nEmulators set up by build-script:");
         for (index, avd) in avds.iter().enumerate() {
@@ -255,7 +255,7 @@ fn start_or_set_up_emulator(adb: &Path, sdk_root: &Path, min_sdk: i64) -> Result
 
         match system::prompt("Choose [1]: ")?.as_str() {
             "" => avds[0].name.clone(),
-            "n" => set_up_avd(sdk_root, &home, min_sdk)?,
+            "n" => set_up_virtual_device(sdk_root, &home, min_sdk)?,
             answer => {
                 let index: usize = answer.parse().map_err(|_| "cancelled".to_string())?;
                 avds.get(index.wrapping_sub(1))
@@ -278,8 +278,12 @@ fn start_or_set_up_emulator(adb: &Path, sdk_root: &Path, min_sdk: i64) -> Result
 }
 
 /// Lets the user pick a system image, installs it with the emulator and creates the AVD
-fn set_up_avd(sdk_root: &Path, home: &Path, min_sdk: i64) -> Result<String, String> {
-    let abi = host_abi();
+fn set_up_virtual_device(sdk_root: &Path, home: &Path, min_sdk: i64) -> Result<String, String> {
+    // what runs fast on this machine
+    let abi = match system::host_architecture() {
+        Ok(HostArchitecture::Aarch64) => "arm64-v8a",
+        _ => "x86_64",
+    };
     println!("Loading the list of system images ...");
 
     let mut catalogs = vec![];
@@ -373,7 +377,7 @@ fn set_up_avd(sdk_root: &Path, home: &Path, min_sdk: i64) -> Result<String, Stri
         catalogs[catalog_index].install(sdk_root, &image.path, &image_dir, false)?;
     }
 
-    let name = create_avd(home, &image)?;
+    let name = create_virtual_device(home, &image)?;
     println!("Created emulator {name}");
 
     return Ok(name);
@@ -570,7 +574,7 @@ fn system_images(catalog: &SdkCatalog, abi: &str, min_sdk: i64) -> Vec<SystemIma
 }
 
 /// The AVDs build-script set up
-fn list_avds(home: &Path) -> Vec<AndroidVirtualDevice> {
+fn list_virtual_devices(home: &Path) -> Vec<AndroidVirtualDevice> {
     let Ok(entries) = fs::read_dir(home) else {
         return vec![];
     };
@@ -599,7 +603,7 @@ fn list_avds(home: &Path) -> Vec<AndroidVirtualDevice> {
 }
 
 /// Writes the files avdmanager would write, returns the AVD name
-fn create_avd(home: &Path, image: &SystemImage) -> Result<String, String> {
+fn create_virtual_device(home: &Path, image: &SystemImage) -> Result<String, String> {
     let name = format!(
         "build-script-api{}-{}",
         image.version.replace('.', "_"),
@@ -653,14 +657,6 @@ fn create_avd(home: &Path, image: &SystemImage) -> Result<String, String> {
     system::write_file(&home.join(format!("{name}.ini")), &ini)?;
 
     return Ok(name);
-}
-
-/// The ABI system images need to run fast on this machine
-fn host_abi() -> &'static str {
-    match system::host_architecture() {
-        Ok(HostArchitecture::Aarch64) => return "arm64-v8a",
-        _ => return "x86_64",
-    }
 }
 
 /// What `am instrument -r` reports, read line by line: a block of
@@ -1099,7 +1095,7 @@ INSTRUMENTATION_CODE: -1";
             size: 1,
         };
 
-        let name = create_avd(&home, &image).unwrap();
+        let name = create_virtual_device(&home, &image).unwrap();
         assert_eq!(name, "build-script-api36-google_apis_playstore");
 
         let config = fs::read_to_string(home.join(format!("{name}.avd/config.ini"))).unwrap();
@@ -1121,7 +1117,7 @@ INSTRUMENTATION_CODE: -1";
                 .contains("target=android-36")
         );
 
-        let avds = list_avds(&home);
+        let avds = list_virtual_devices(&home);
         assert_eq!(
             avds,
             [AndroidVirtualDevice {

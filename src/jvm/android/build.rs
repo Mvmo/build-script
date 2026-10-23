@@ -35,6 +35,8 @@ const VIEW_BINDING_VERSION: &str = "8.1.0";
 const CMAKE_VERSION: &str = "3.22.1";
 /// what the Android Gradle plugin builds without abiFilters
 const ABIS: &[&str] = &["armeabi-v7a", "arm64-v8a", "x86", "x86_64"];
+/// the CMake builds, and the libraries in libs/<abi> like jniLibs
+const CMAKE_DIR: &str = "build/intermediates/cmake";
 
 /// What aapt2 links: the app, or a library with or without the resources of its libraries
 #[derive(Clone, Copy, PartialEq)]
@@ -133,7 +135,7 @@ pub fn native_library_dirs(
     let mut dirs = source_set_dirs_with_files(inputs, "jniLibs");
 
     if args.get::<Option<String>>("cmake")?.is_some() {
-        dirs.push(CMakeBuild::libraries_dir(&cmake_dir(inputs)));
+        dirs.push(inputs.directory.join(CMAKE_DIR).join("libs"));
     }
 
     return Ok(dirs);
@@ -570,7 +572,7 @@ impl AndroidBuild {
             sdk_root: &self.sdk.root,
             ndk_version: &self.ndk_version,
             min_sdk: self.min_sdk,
-            work_dir: cmake_dir(&self.inputs),
+            work_dir: self.inputs.directory.join(CMAKE_DIR),
             accept_license: self.accept_license,
         }
         .run(&|message| system::log(&self.inputs.name, message));
@@ -1267,7 +1269,7 @@ impl UnpackedLibraries {
         let mut aars = vec![];
 
         for file in &resolved.libraries {
-            if is_aar(file) {
+            if file.extension().is_some_and(|extension| extension == "aar") {
                 aars.push(unpacked.unpack_aar(file, sdk)?);
             } else {
                 unpacked.jars.push(file.clone());
@@ -1310,11 +1312,12 @@ impl UnpackedLibraries {
 
         // compile only aars contribute their classes, not their resources
         for file in &resolved.compile_only {
-            if is_aar(file) {
-                unpacked.compile_only.extend(system::files_with_extension(
-                    &[system::kept_in_cache("extracted", file, |target| system::extract(file, target))?],
-                    "jar",
-                ));
+            if file.extension().is_some_and(|extension| extension == "aar") {
+                let extract = |target: &Path| system::extract(file, target);
+                let extracted = system::kept_in_cache("extracted", file, extract)?;
+                unpacked
+                    .compile_only
+                    .extend(system::files_with_extension(&[extracted], "jar"));
             } else {
                 unpacked.compile_only.push(file.clone());
             }
@@ -1335,7 +1338,8 @@ impl UnpackedLibraries {
             .to_string_lossy()
             .to_string();
 
-        let target = system::kept_in_cache("extracted", aar, |target| system::extract(aar, target))?;
+        let extract = |target: &Path| system::extract(aar, target);
+        let target = system::kept_in_cache("extracted", aar, extract)?;
 
         let classes = target.join("classes.jar");
 
@@ -1399,17 +1403,12 @@ struct CMakeBuild<'a> {
     sdk_root: &'a Path,
     ndk_version: &'a str,
     min_sdk: i64,
-    /// build/intermediates/cmake: the CMake builds and the libraries in libs/<abi>
+    /// CMAKE_DIR of the module
     work_dir: PathBuf,
     accept_license: bool,
 }
 
 impl CMakeBuild<'_> {
-    /// One directory per ABI like jniLibs
-    fn libraries_dir(work_dir: &Path) -> PathBuf {
-        return work_dir.join("libs");
-    }
-
     /// Installs the NDK and CMake if needed, then configures and builds the
     /// libraries for every ABI, a debug build like the Gradle plugin's
     fn run(&self, log: &dyn Fn(&str)) -> Result<(), String> {
@@ -1446,7 +1445,7 @@ impl CMakeBuild<'_> {
             .parent()
             .ok_or_else(|| format!("{} has no directory", self.cmake_lists.display()))?;
 
-        let libraries = Self::libraries_dir(&self.work_dir);
+        let libraries = self.work_dir.join("libs");
         system::remove_dir(&libraries)?;
 
         for abi in ABIS {
@@ -1486,10 +1485,8 @@ impl CMakeBuild<'_> {
     }
 }
 
-/// aapt2 compile of a res directory into a zip, renamed once complete: compiled resources of aars are cached
-/// aapt2 compile of a res directory into <name>-<hash of its files>.zip in
-/// `res_cache`, again only when they change: an app compiles those of all its
-/// library modules, projects with many of them would compile all on every build
+/// aapt2 compile of a res directory into <name>-<hash of its files>.zip in `res_cache`,
+/// again only when they change: an app compiles those of all its library modules
 fn compiled_resources(
     sdk: &AndroidSdk,
     res_dir: &Path,
@@ -1555,10 +1552,6 @@ fn compile_resources(aapt2: &Path, res_dir: &Path, output: &Path) -> Result<(), 
         .map_err(|error| format!("could not save {}: {error}", output.display()));
 }
 
-fn is_aar(file: &Path) -> bool {
-    return file.extension().is_some_and(|extension| extension == "aar");
-}
-
 /// `name` (jniLibs) of the main and the debug source set where it has files, lowest priority first
 fn source_set_dirs_with_files(inputs: &ModuleBuildInputs, name: &str) -> Vec<PathBuf> {
     return ["src/main", "src/debug"]
@@ -1566,10 +1559,6 @@ fn source_set_dirs_with_files(inputs: &ModuleBuildInputs, name: &str) -> Vec<Pat
         .map(|source_set| inputs.directory.join(source_set).join(name))
         .filter(|dir| system::contains_files(dir))
         .collect();
-}
-
-fn cmake_dir(inputs: &ModuleBuildInputs) -> PathBuf {
-    return inputs.directory.join("build/intermediates/cmake");
 }
 
 /// d8 output worth showing, and how many lines of known noise it hid. d8
