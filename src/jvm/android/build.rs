@@ -36,6 +36,14 @@ const CMAKE_VERSION: &str = "3.22.1";
 /// what the Android Gradle plugin builds without abiFilters
 const ABIS: &[&str] = &["armeabi-v7a", "arm64-v8a", "x86", "x86_64"];
 
+/// What aapt2 links: the app, or a library with or without the resources of its libraries
+#[derive(Clone, Copy, PartialEq)]
+pub enum LinkedResources {
+    App,
+    LibraryWithItsLibraries,
+    LibraryAlone,
+}
+
 /// What app and library builds share up to compiling Kotlin
 pub struct AndroidBuild {
     pub inputs: ModuleBuildInputs,
@@ -430,19 +438,6 @@ impl AndroidBuild {
         return Ok(manifest);
     }
 
-    /// aapt2 link of the app: its resources and those of all libraries, the
-    /// ids of all of them in `symbols`
-    pub fn link(
-        &self,
-        manifest: &Path,
-        own: &[PathBuf],
-        output: &Path,
-        symbols: &Path,
-        extra: &[String],
-    ) -> Result<(), String> {
-        return self.run_link(manifest, own, true, output, symbols, false, extra);
-    }
-
     /// The symbols of a library in `symbols`, to write its R classes from. Like
     /// the Gradle plugin, libraries may use resources that only the app has,
     /// aapt2 checks references when it links the app.
@@ -454,13 +449,12 @@ impl AndroidBuild {
         symbols: &Path,
     ) -> Result<(), String> {
         let with_libraries = work_dir.join("R-with-libraries.txt");
-        self.run_link(
+        self.link(
             manifest,
             own,
-            true,
+            LinkedResources::LibraryWithItsLibraries,
             &work_dir.join("library.ap_"),
             &with_libraries,
-            true,
             &[],
         )?;
 
@@ -469,13 +463,12 @@ impl AndroidBuild {
         }
 
         let own_only = work_dir.join("R-own.txt");
-        self.run_link(
+        self.link(
             manifest,
             own,
-            false,
+            LinkedResources::LibraryAlone,
             &work_dir.join("library-own.ap_"),
             &own_only,
-            true,
             &[],
         )?;
 
@@ -1024,14 +1017,14 @@ impl AndroidBuild {
         return Ok(());
     }
 
-    fn run_link(
+    /// aapt2 link of the module's resources `own`, the ids in `symbols`
+    pub fn link(
         &self,
         manifest: &Path,
         own: &[PathBuf],
-        with_libraries: bool,
+        resources: LinkedResources,
         output: &Path,
         symbols: &Path,
-        library: bool,
         extra: &[String],
     ) -> Result<(), String> {
         system::create_parent_dir(output)?;
@@ -1053,7 +1046,7 @@ impl AndroidBuild {
             .arg(self.min_sdk.to_string())
             .args(extra);
 
-        if library {
+        if resources != LinkedResources::App {
             command.arg("--non-final-ids");
             // aapt2 links stubs of the framework itself only as an app
             if self.namespace != "android" {
@@ -1062,10 +1055,10 @@ impl AndroidBuild {
         }
 
         // later overlays win: libraries, then the module itself
-        let libraries = if with_libraries {
-            &self.libraries[..]
-        } else {
+        let libraries = if resources == LinkedResources::LibraryAlone {
             &[][..]
+        } else {
+            &self.libraries[..]
         };
 
         for compiled in libraries

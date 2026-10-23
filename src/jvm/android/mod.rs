@@ -22,8 +22,8 @@ use crate::language::runtime::{
 };
 
 use build::{
-    AndroidBuild, DEFAULT_NDK_VERSION, android_input_paths, existing_dirs, merge_java_resources,
-    native_library_dirs, read_android_inputs,
+    AndroidBuild, DEFAULT_NDK_VERSION, LinkedResources, android_input_paths, existing_dirs,
+    merge_java_resources, native_library_dirs, read_android_inputs,
 };
 use device::InstrumentedTests;
 use generated::SymbolTable;
@@ -461,7 +461,14 @@ impl Apk<'_> {
             extra.extend(["-A".to_string(), assets.display().to_string()]);
         }
 
-        build.link(self.manifest, &own_resources, &linked, &symbols, &extra)?;
+        build.link(
+            self.manifest,
+            &own_resources,
+            LinkedResources::App,
+            &linked,
+            &symbols,
+            &extra,
+        )?;
 
         // the app generates the final R classes of all libraries
         let mut generated_sources = build.write_r_classes(
