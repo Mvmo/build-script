@@ -1,4 +1,4 @@
-// Jars merged into one: the classes and resources of a fat jar
+// Jars merged into one: the classes and resources of a fat jar, the Java resources of an apk
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,13 +6,31 @@ use std::process::{Command, Stdio};
 
 use crate::common::system;
 
+/// What of the jars is merged
+#[derive(Clone, Copy)]
+pub enum JarContents {
+    /// what an apk packages besides the dex files
+    JavaResources,
+    /// what a fat jar needs, the classes of newer Java versions included
+    ClassesAndResources,
+}
+
 /// The files of the jars in `output`: the first jar wins, META-INF/services files are
 /// concatenated. Returns how many classes were left out with another content than the winner.
-pub fn merge_jars(jars: &[PathBuf], output: &Path, scratch: &Path) -> Result<usize, String> {
+pub fn merge_jars(
+    jars: &[PathBuf],
+    contents: JarContents,
+    output: &Path,
+    scratch: &Path,
+) -> Result<usize, String> {
     system::recreate_dir(output)?;
 
     // jars in the cache never change, like those from Maven: they are extracted once
     let cache = system::cache_dir("");
+    let cache_name = match contents {
+        JarContents::JavaResources => "java-resources",
+        JarContents::ClassesAndResources => "jar-contents",
+    };
 
     let mut merged = HashSet::new();
     let mut differing_classes = 0;
@@ -23,10 +41,10 @@ pub fn merge_jars(jars: &[PathBuf], output: &Path, scratch: &Path) -> Result<usi
         }
 
         let extracted = if jar.starts_with(&cache) {
-            let extract = |target: &Path| extract_contents(jar, target);
-            system::kept_in_cache("jar-contents", jar, extract)?
+            let extract = |target: &Path| extract_contents(jar, contents, target);
+            system::kept_in_cache(cache_name, jar, extract)?
         } else {
-            extract_contents(jar, scratch)?;
+            extract_contents(jar, contents, scratch)?;
             scratch.to_path_buf()
         };
 
@@ -77,10 +95,17 @@ pub fn merge_jars(jars: &[PathBuf], output: &Path, scratch: &Path) -> Result<usi
     return Ok(differing_classes);
 }
 
-/// Without the manifest and the signatures, they belong to the jar they come from,
-/// and without module-info.class, a fat jar is no Java module
-fn extract_contents(jar: &Path, target: &Path) -> Result<(), String> {
+/// Without the manifest and the signatures, they belong to the jar they come from
+fn extract_contents(jar: &Path, contents: JarContents, target: &Path) -> Result<(), String> {
     system::recreate_dir(target)?;
+
+    let excluded: &[&str] = match contents {
+        JarContents::JavaResources => &["*.class", "META-INF/versions/*"],
+        // a fat jar is no Java module
+        JarContents::ClassesAndResources => {
+            &["module-info.class", "META-INF/versions/*/module-info.class"]
+        }
+    };
 
     let mut unzip = Command::new("unzip");
     unzip
@@ -94,9 +119,8 @@ fn extract_contents(jar: &Path, target: &Path) -> Result<(), String> {
             "META-INF/*.RSA",
             "META-INF/*.DSA",
             "META-INF/*.EC",
-            "module-info.class",
-            "META-INF/versions/*/module-info.class",
         ])
+        .args(excluded)
         .arg("-d")
         .arg(target);
 

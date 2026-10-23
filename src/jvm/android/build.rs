@@ -177,58 +177,6 @@ pub fn android_input_paths(
     return Ok(paths);
 }
 
-/// Non-class files of the jars, like the Gradle plugin packages them: the
-/// first jar wins, META-INF/services files are concatenated
-pub fn merge_java_resources(jars: &[PathBuf], output: &Path, scratch: &Path) -> Result<(), String> {
-    system::recreate_dir(output)?;
-    // jars of the cache never change, like those of Maven and of aars: their resources are extracted once
-    let cache = system::cache_dir("");
-    for jar in unique(jars) {
-        let resources = if jar.starts_with(&cache) {
-            system::kept_in_cache("java-resources", &jar, |target| {
-                extract_java_resources(&jar, target)
-            })?
-        } else {
-            extract_java_resources(&jar, scratch)?;
-            scratch.to_path_buf()
-        };
-
-        for path in system::files_below(&[resources.clone()]) {
-            let relative = path
-                .strip_prefix(&resources)
-                .map_err(|error| error.to_string())?;
-
-            let target = output.join(relative);
-
-            let is_service = relative.starts_with("META-INF/services");
-            if target.exists() && !is_service {
-                continue;
-            }
-
-            let mut content = fs::read(&path)
-                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-
-            if target.exists() {
-                let mut existing = fs::read(&target)
-                    .map_err(|error| format!("could not read {}: {error}", target.display()))?;
-
-                if !existing.ends_with(b"\n") {
-                    existing.push(b'\n');
-                }
-
-                existing.extend(content);
-                content = existing;
-            }
-
-            system::create_parent_dir(&target)?;
-            fs::write(&target, content)
-                .map_err(|error| format!("could not write {}: {error}", target.display()))?;
-        }
-    }
-
-    return system::remove_dir(scratch);
-}
-
 impl AndroidBuild {
     pub fn prepare(inputs: ModuleBuildInputs, args: &Arguments) -> Result<Self, String> {
         let build_dir = inputs.directory.join("build");
@@ -1149,46 +1097,6 @@ impl AndroidBuild {
     fn min_api(&self) -> i64 {
         return self.min_sdk.max(NATIVE_MULTIDEX_API);
     }
-}
-
-/// The non-class files of a jar, without its manifest and signatures
-fn extract_java_resources(jar: &Path, target: &Path) -> Result<(), String> {
-    system::recreate_dir(target)?;
-    let mut unzip = Command::new("unzip");
-    unzip
-        .stdin(Stdio::null())
-        .args(["-q", "-o"])
-        .arg(jar)
-        .args([
-            "-x",
-            "*.class",
-            "META-INF/MANIFEST.MF",
-            "META-INF/*.SF",
-            "META-INF/*.RSA",
-            "META-INF/*.DSA",
-            "META-INF/*.EC",
-            "META-INF/versions/*",
-        ])
-        .arg("-d")
-        .arg(target);
-
-    // exit code 1 = only warnings (an exclude pattern did not match), 11 = nothing left to extract
-    let result = unzip
-        .output()
-        .map_err(|error| format!("could not start unzip: {error}"))?;
-
-    if !matches!(result.status.code(), Some(0 | 1 | 11)) {
-        return Err(format!(
-            "unzip of {} failed ({}): {}",
-            jar.display(),
-            result.status,
-            String::from_utf8_lossy(&result.stderr).trim()
-        ));
-    }
-
-    system::make_accessible(target);
-
-    return Ok(());
 }
 
 /// Each path once, in the order they come

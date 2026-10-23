@@ -10,7 +10,7 @@ use crate::language::runtime::{
 };
 
 use super::JvmLaunch;
-use super::jar_merge;
+use super::jar_merge::{self, JarContents};
 use super::maven::TargetPlatform;
 use super::module::{
     Compilation, ModuleBuildInputs, Sources, classes_kind, create_jar, dependencies_type,
@@ -247,8 +247,12 @@ fn build_fat_jar(
 
     system::log(&inputs.name, &format!("Fat jar of {} jars", jars.len()));
 
-    let differing_classes =
-        jar_merge::merge_jars(jars, &contents, &work_dir.join("scratch"))?;
+    let differing_classes = jar_merge::merge_jars(
+        jars,
+        JarContents::ClassesAndResources,
+        &contents,
+        &work_dir.join("scratch"),
+    )?;
 
     if differing_classes > 0 {
         let message = format!("{differing_classes} classes are in several jars, the first counts");
