@@ -14,10 +14,10 @@ use crate::language::parser::{
     TypeExpression, TypeExpressionType, UnaryOperator, UseTarget,
 };
 
-use functions::{BuiltinFunction, CallArgument, FunctionParam, ParamDefault, UserFunction, bind};
+use functions::{BuiltinFunction, CallArgument, FunctionParam, UserFunction, bind};
 
 pub use error::{RuntimeError, RuntimeErrorType};
-pub use functions::{Args, FunctionParams, FunctionSignature, builtin};
+pub use functions::{Args, FromValue, FunctionParams, FunctionSignature, ParamDefault, builtin};
 pub use values::{
     BuildFailure, BuiltModule, ModuleOutput, ModuleTests, PendingModule, TestCounts, TestOutcome,
     TestRun, TestRunner, TestSuite, Type, Value, launch,
@@ -136,6 +136,39 @@ impl Runtime {
             self.run_statement(statement)?;
         }
         return Ok(());
+    }
+
+    /// The value of `expression` after the assignments of the script before
+    /// `before`, without building anything: of the platform functions only
+    /// `functions` are there, assignments that need others are left out. For
+    /// install, which reads the repositories of a module from the script.
+    pub fn evaluate_unbuilt(
+        &mut self,
+        script: &Script,
+        before: usize,
+        functions: Vec<(&'static str, Value)>,
+        expression: &Expression,
+    ) -> Result<Value, RuntimeError> {
+        for (name, value) in functions {
+            self.define(name, value);
+        }
+
+        for statement in &script.statements {
+            if statement.span.start >= before {
+                break;
+            }
+
+            let StatementType::Expression(expression) = &statement.variant else {
+                continue;
+            };
+
+            // their variables stay undefined, whatever uses them fails
+            if matches!(expression.variant, ExpressionType::Assignment { .. }) {
+                let _ = self.evaluate(expression);
+            }
+        }
+
+        return self.evaluate(expression);
     }
 
     /// Waits for the builds still running. The modules in build order, or why builds
@@ -773,7 +806,7 @@ impl Scope {
     }
 }
 
-fn platforms() -> impl Iterator<Item = &'static Platform> {
+pub fn platforms() -> impl Iterator<Item = &'static Platform> {
     return PLATFORMS.iter().flat_map(|category| category.iter());
 }
 

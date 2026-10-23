@@ -559,7 +559,8 @@ impl ModuleBuildInputs {
     /// function, the JDK, the sources, `extra_inputs` like resources and what
     /// the modules among the arguments and all modules below them produced,
     /// processors included. Maven dependencies count through the arguments,
-    /// their files never change. Kept in build/fingerprints/`name`.
+    /// their files never change, except for the newest build of a SNAPSHOT.
+    /// Kept in build/fingerprints/`name`.
     pub fn input_fingerprint(
         &self,
         name: &str,
@@ -573,6 +574,22 @@ impl ModuleBuildInputs {
         fingerprint.add(&self.jdk.home);
         fingerprint.add_files(&self.source_dirs)?;
         fingerprint.add_files(extra_inputs)?;
+
+        let snapshots: Vec<MavenCoordinate> = self
+            .dependencies
+            .libraries
+            .iter()
+            .chain(&self.compile_only.libraries)
+            .chain(&self.annotation_processors.libraries)
+            .filter(|coordinate| coordinate.is_snapshot())
+            .cloned()
+            .collect();
+
+        if !snapshots.is_empty() {
+            let mut resolver =
+                DependencyResolver::new(self.repositories.clone(), TargetPlatform::Jvm);
+            fingerprint.add(resolver.snapshot_poms(&snapshots)?);
+        }
 
         for module in BuiltModule::transitive(&args.modules()) {
             fingerprint.add(&module.name);

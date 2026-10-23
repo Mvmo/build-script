@@ -1,4 +1,5 @@
 // Maven: repositories, coordinates, dependency notations and versions, like in Gradle
+mod metadata;
 mod pom;
 mod resolver;
 
@@ -9,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::common::system;
 use crate::language::runtime::{FunctionParams, Type, Value, builtin};
 
+pub use metadata::refresh;
 pub use pom::license_report;
 pub use resolver::DependencyResolver;
 
@@ -46,8 +48,19 @@ pub struct MavenCoordinate {
 
 #[derive(Debug, Clone)]
 pub enum MavenRepository {
-    Remote(String),
+    Remote {
+        url: String,
+        credentials: Option<RepositoryCredentials>,
+    },
     Local(PathBuf),
+}
+
+/// The environment variables with the user name and password of a repository.
+/// Their values are read only to download, so they are in no script and no log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepositoryCredentials {
+    pub username_env: String,
+    pub password_env: String,
 }
 
 /// group, artifact, classifier: what belongs together in version conflicts
@@ -74,14 +87,32 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
             "google",
             builtin("google", repository(), |_, _| Ok(GOOGLE.into())),
         ),
+        // credentials come from environment variables, the script only names them
         (
             "maven",
             builtin(
                 "maven",
                 FunctionParams::new()
                     .required("url", Type::String)
+                    .optional("username_env", Type::String)
+                    .optional("password_env", Type::String)
                     .returns(Type::String),
-                |_, args| Ok(args.get::<String>("url")?.into()),
+                |_, args| {
+                    let url: String = args.get("url")?;
+
+                    match (args.get("username_env")?, args.get("password_env")?) {
+                        (None, None) => return Ok(url.into()),
+                        (Some(username_env), Some(password_env)) => {
+                            let credentials =
+                                RepositoryCredentials::new(username_env, password_env)?;
+                            let repository = format!("{url} {credentials}");
+                            MavenRepository::parse(&repository, Path::new(""))?;
+
+                            return Ok(repository.into());
+                        }
+                        _ => return Err("username_env and password_env go together".to_string()),
+                    }
+                },
             ),
         ),
         // a BOM whose versions apply to the other dependencies
@@ -107,10 +138,44 @@ pub fn repositories(specs: &[String], project_dir: &Path) -> Result<Vec<MavenRep
     if specs.is_empty() {
         return Err("specify at least one repository, e.g. maven_central()".to_string());
     }
-    return Ok(specs
+    return specs
         .iter()
         .map(|spec| MavenRepository::parse(spec, project_dir))
-        .collect());
+        .collect();
+}
+
+/// The highest version the repositories have together, a final one when there
+/// is one: milestones, release candidates and SNAPSHOTs only when nothing else is there
+pub fn newest_version(
+    repositories: &[MavenRepository],
+    coordinate: &MavenCoordinate,
+) -> Result<String, String> {
+    let mut versions: Vec<String> = vec![];
+
+    for repository in repositories {
+        if let Some(metadata) = metadata::fetch(repository, &coordinate.artifact_directory())? {
+            versions.extend(metadata.versions().iter().cloned());
+        }
+    }
+
+    let newest = |stable: bool| {
+        versions
+            .iter()
+            .filter(|version| !stable || is_final(version))
+            .max_by(|left, right| compare_versions(left, right))
+            .cloned()
+    };
+
+    let names: Vec<String> = repositories.iter().map(ToString::to_string).collect();
+
+    return newest(true).or_else(|| newest(false)).ok_or_else(|| {
+        format!(
+            "{}:{} is in none of the repositories ({}), the one that has it goes into the script as maven(url)",
+            coordinate.group,
+            coordinate.artifact,
+            names.join(", ")
+        )
+    });
 }
 
 /// Simplified comparison in the style of Maven's ComparableVersion
@@ -188,6 +253,10 @@ impl MavenCoordinate {
         });
     }
 
+    pub fn is_snapshot(&self) -> bool {
+        return self.version.ends_with(metadata::SNAPSHOT);
+    }
+
     fn module_key(&self) -> MavenModuleKey {
         return (
             self.group.clone(),
@@ -205,7 +274,7 @@ impl MavenCoordinate {
     }
 
     /// group/as/path/artifact, with a directory per version below
-    fn artifact_directory(&self) -> String {
+    pub fn artifact_directory(&self) -> String {
         return format!("{}/{}", self.group.replace('.', "/"), self.artifact);
     }
 
@@ -277,15 +346,94 @@ impl MavenCoordinate {
 
 impl MavenRepository {
     /// http(s) URLs are remote repositories, anything else is a directory
-    /// (optionally prefixed with file://), relative to the project
-    pub fn parse(spec: &str, project_dir: &Path) -> Self {
-        if spec.starts_with("https://") || spec.starts_with("http://") {
-            return MavenRepository::Remote(spec.trim_end_matches('/').to_string());
+    /// (optionally prefixed with file://), relative to the project. Remote ones
+    /// may be followed by credentials(USERNAME_ENV, PASSWORD_ENV).
+    pub fn parse(spec: &str, project_dir: &Path) -> Result<Self, String> {
+        let (location, credentials) = match spec.split_once(" credentials(") {
+            Some((location, names)) => (location, Some(RepositoryCredentials::parse(names)?)),
+            None => (spec, None),
+        };
+
+        if location.starts_with("https://") || location.starts_with("http://") {
+            return Ok(MavenRepository::Remote {
+                url: location.trim_end_matches('/').to_string(),
+                credentials,
+            });
         }
 
-        let path = spec.strip_prefix("file://").unwrap_or(spec);
+        if credentials.is_some() {
+            return Err(format!("{location}: only http(s) repositories take credentials"));
+        }
 
-        return MavenRepository::Local(project_dir.join(path));
+        let path = location.strip_prefix("file://").unwrap_or(location);
+
+        return Ok(MavenRepository::Local(project_dir.join(path)));
+    }
+
+    /// The user name and password from the environment, for repositories that need them
+    pub fn credentials(&self) -> Result<Option<system::Credentials>, String> {
+        let MavenRepository::Remote {
+            url,
+            credentials: Some(credentials),
+        } = self
+        else {
+            return Ok(None);
+        };
+
+        let value = |name: &str| {
+            std::env::var(name).map_err(|_| {
+                format!(
+                    "{url} takes its credentials from {} and {}, but {name} is not set",
+                    credentials.username_env, credentials.password_env
+                )
+            })
+        };
+
+        return Ok(Some(system::Credentials {
+            username: value(&credentials.username_env)?,
+            password: value(&credentials.password_env)?,
+        }));
+    }
+}
+
+impl RepositoryCredentials {
+    /// Only names of environment variables: whoever passes the password itself
+    /// by mistake must not find it in an error message
+    pub fn new(username_env: String, password_env: String) -> Result<Self, String> {
+        let names = [("username_env", &username_env), ("password_env", &password_env)];
+
+        for (parameter, name) in names {
+            let mut chars = name.chars();
+            let valid = chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|char| char.is_ascii_alphanumeric() || char == '_');
+
+            if !valid {
+                return Err(format!(
+                    "{parameter} takes the name of an environment variable, like REPOSITORY_USER, not its value"
+                ));
+            }
+        }
+
+        return Ok(RepositoryCredentials {
+            username_env,
+            password_env,
+        });
+    }
+
+    /// `USERNAME_ENV, PASSWORD_ENV)`, what follows `credentials(`
+    fn parse(names: &str) -> Result<Self, String> {
+        let names = names.trim_end().strip_suffix(')').unwrap_or(names);
+
+        let Some((username_env, password_env)) = names.split_once(',') else {
+            return Err("credentials(...) takes the names of two environment variables".to_string());
+        };
+
+        return RepositoryCredentials::new(
+            username_env.trim().to_string(),
+            password_env.trim().to_string(),
+        );
     }
 }
 
@@ -339,9 +487,15 @@ impl fmt::Display for MavenCoordinate {
 impl fmt::Display for MavenRepository {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            MavenRepository::Remote(url) => return write!(f, "{url}"),
+            MavenRepository::Remote { url, .. } => return write!(f, "{url}"),
             MavenRepository::Local(path) => return write!(f, "{}", path.display()),
         }
+    }
+}
+
+impl fmt::Display for RepositoryCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        return write!(f, "credentials({}, {})", self.username_env, self.password_env);
     }
 }
 
@@ -416,6 +570,15 @@ fn version_parts(version: &str) -> Vec<MavenVersionPart> {
     return parts;
 }
 
+/// No alpha, beta, milestone, release candidate or SNAPSHOT. Unknown qualifiers
+/// like the jre of Guava's 33.6.0-jre count as final.
+fn is_final(version: &str) -> bool {
+    return version_parts(version).iter().all(|part| match part {
+        MavenVersionPart::Number(_) => true,
+        MavenVersionPart::Text(text) => qualifier_rank(text).is_none_or(|rank| rank >= RELEASE),
+    });
+}
+
 fn qualifier_rank(qualifier: &str) -> Option<u8> {
     return Some(match qualifier {
         "dev" | "eap" => 0,
@@ -471,5 +634,48 @@ mod tests {
         assert_eq!(compare("1.0", "1.0.0"), Ordering::Equal);
         assert_eq!(compare("1.0.1", "1.0"), Ordering::Greater);
         assert_eq!(compare("33.1.0-jre", "33.0.0-jre"), Ordering::Greater);
+        assert_eq!(compare("26.3-R0.1-SNAPSHOT", "26.3-R0.1"), Ordering::Less);
+
+        assert!(is_final("33.6.0-jre") && is_final("1.21-R0.4") && is_final("2.0.0.Final"));
+        assert!(!is_final("2.3.0-Beta1") && !is_final("1.0-RC") && !is_final("26.3-R0.1-SNAPSHOT"));
+    }
+
+    #[test]
+    fn repositories_name_the_environment_variables_of_their_credentials() {
+        let project = Path::new("/project");
+
+        let MavenRepository::Remote { url, credentials } = MavenRepository::parse(
+            "https://nexus.example.com/repository/releases/ credentials(NEXUS_USER, NEXUS_TOKEN)",
+            project,
+        )
+        .unwrap() else {
+            panic!("a remote repository");
+        };
+
+        assert_eq!(url, "https://nexus.example.com/repository/releases");
+        assert_eq!(
+            credentials.unwrap().to_string(),
+            "credentials(NEXUS_USER, NEXUS_TOKEN)"
+        );
+
+        // a password passed by mistake does not show up in the error
+        let error = RepositoryCredentials::new("NEXUS_USER".to_string(), "s3cr3t!pw".to_string())
+            .unwrap_err();
+        assert!(error.starts_with("password_env takes the name"), "{error}");
+        assert!(!error.contains("s3cr3t"), "{error}");
+
+        assert!(MavenRepository::parse("libs credentials(A, B)", project).is_err());
+        assert!(matches!(
+            MavenRepository::parse("my libs", project).unwrap(),
+            MavenRepository::Local(path) if path == Path::new("/project/my libs")
+        ));
+
+        let missing = MavenRepository::parse(
+            "https://nexus.example.com credentials(BUILD_SCRIPT_TEST_UNSET_USER, BUILD_SCRIPT_TEST_UNSET_TOKEN)",
+            project,
+        )
+        .unwrap();
+        let error = missing.credentials().err().unwrap();
+        assert!(error.ends_with("but BUILD_SCRIPT_TEST_UNSET_USER is not set"), "{error}");
     }
 }
