@@ -23,9 +23,8 @@ const IMAGE_SOURCES: &[(&str, &str)] = &[
 const IMAGES_PER_SOURCE: usize = 3;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Instrumented tests in an apk that instruments itself: installed on a device, run
-/// with `am instrument`, their results written as JUnit XML. Like the Gradle plugin
-/// does it, the apk is uninstalled afterwards.
+/// An apk that instruments itself: installed, run with `am instrument`, results
+/// written as JUnit XML, then uninstalled like the Gradle plugin does it
 #[derive(Debug)]
 pub struct InstrumentedTests {
     pub apk: PathBuf,
@@ -659,10 +658,8 @@ fn create_virtual_device(home: &Path, image: &SystemImage) -> Result<String, Str
     return Ok(name);
 }
 
-/// What `am instrument -r` reports, read line by line: a block of
-/// INSTRUMENTATION_STATUS lines per test event, ended by its status code, then
-/// INSTRUMENTATION_RESULT lines and the code of the whole run. Values like stack
-/// traces go on over lines of their own.
+/// What `am instrument -r` reports line by line: INSTRUMENTATION_STATUS blocks per test
+/// event ending in a status code, then INSTRUMENTATION_RESULT lines and the run's code.
 #[derive(Debug, Default)]
 struct Instrumentation {
     tests: Vec<InstrumentedTest>,

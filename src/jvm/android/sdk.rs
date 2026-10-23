@@ -115,10 +115,8 @@ impl AndroidSdk {
         return Ok(target.join(name));
     }
 
-    /// An installed SDK (ANDROID_HOME) is used as it is, otherwise missing
-    /// packages are installed to <build home>/android-sdk, but only once their
-    /// license was accepted: in the terminal, or with accept_sdk_license where
-    /// there is no terminal to ask
+    /// An installed SDK (ANDROID_HOME) as it is, otherwise the packages in <build home>/android-sdk,
+    /// once their license is accepted: in the terminal, or with accept_sdk_license
     pub fn ensure(
         compile_sdk: i64,
         build_tools: &str,
@@ -354,9 +352,8 @@ impl SdkCatalog {
         return system::remove_dir(&unpacked);
     }
 
-    /// Like sdkmanager: accepted licenses are kept as hashes in <sdk>/licenses/<id>.
-    /// `consent` decides about a license not accepted yet, it gets the id, the
-    /// text and the file the text was saved to.
+    /// Like sdkmanager: accepted licenses are hashes in <sdk>/licenses/<id>. `consent` gets
+    /// the id, the text and its file, and decides about a license not accepted yet.
     pub fn check_license(
         &self,
         sdk_root: &Path,

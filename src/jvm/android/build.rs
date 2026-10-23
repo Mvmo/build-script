@@ -350,9 +350,8 @@ impl AndroidBuild {
         return Ok(outputs);
     }
 
-    /// The manifest for aapt2: with package, and for apps merged with the
-    /// manifests of all libraries. `overlay` lies over the module's manifest, like
-    /// the one of instrumented tests.
+    /// The manifest for aapt2 with its package, for apps merged with those of all
+    /// libraries. `overlay` lies over it, like the manifest of instrumented tests.
     pub fn write_manifest(
         &self,
         source: Option<&Path>,
@@ -440,9 +439,8 @@ impl AndroidBuild {
         return Ok(manifest);
     }
 
-    /// The symbols of a library in `symbols`, to write its R classes from. Like
-    /// the Gradle plugin, libraries may use resources that only the app has,
-    /// aapt2 checks references when it links the app.
+    /// The symbols of a library, its R classes are written from them. Like with Gradle,
+    /// it may use resources only the app has: aapt2 checks references when linking the app.
     pub fn link_library(
         &self,
         manifest: &Path,
@@ -481,10 +479,8 @@ impl AndroidBuild {
         );
     }
 
-    /// For the module (with `own_symbols`) and every library that has one,
-    /// each with the resources it declares. With `ids`, the app's symbols,
-    /// they are final and get the app's ids, otherwise they are for compiling
-    /// against.
+    /// For the module and every library with resources. With `ids`, the app's symbols,
+    /// the fields are final with the app's ids, otherwise they are for compiling against.
     pub fn write_r_classes(
         &self,
         own_symbols: &Path,
@@ -546,9 +542,8 @@ impl AndroidBuild {
         return Ok(file);
     }
 
-    /// Of the module and then of its libraries, highest priority first as
-    /// aapt2 takes a file from the first directory that has it. Like the
-    /// Gradle plugin merges them: debug over main over the libraries.
+    /// Highest priority first, aapt2 takes the first file it finds: debug over main
+    /// over the libraries, like the Gradle plugin merges them.
     pub fn merged_asset_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = self.asset_dirs.clone();
         dirs.reverse();
@@ -623,18 +618,15 @@ impl AndroidBuild {
         return classpath;
     }
 
-    /// Kotlin and Java, the view bindings and AIDL interfaces, what the symbol
-    /// processors generate. `generated` are class directories to compile
-    /// against, like R and BuildConfig. Returns the directories of Java
-    /// resources the symbol processors wrote.
+    /// Kotlin and Java with view bindings, AIDL and what symbol processors generate,
+    /// against `generated` like R and BuildConfig. Returns the processors' resource directories.
     pub fn compile_sources(
         &self,
         generated: &[PathBuf],
         output: &Path,
     ) -> Result<Vec<PathBuf>, String> {
-        // bindings may use the module's own views, AIDL interfaces its classes.
-        // The symbol processors see them too, they skip classes whose signatures
-        // use types they cannot resolve, like bindings.
+        // bindings may use the module's views, AIDL its classes; symbol processors skip
+        // classes with types they cannot resolve, like bindings
         let mut source_dirs = self.inputs.source_dirs.clone();
         source_dirs.push(self.generate_view_bindings()?);
         source_dirs.push(self.generate_aidl()?);
@@ -750,9 +742,8 @@ impl AndroidBuild {
         return Ok(());
     }
 
-    /// The own classes and those of the library modules on every build, the other
-    /// libraries once: like the Gradle plugin dexes them ahead, their dex files are
-    /// kept until one of them changes. Native multidex loads the dex files of both.
+    /// The own classes and those of library modules on every build, other libraries once
+    /// and kept until one changes, like the Gradle plugin. Native multidex loads both.
     pub fn dex(
         &self,
         own: &[PathBuf],
@@ -1561,9 +1552,8 @@ fn source_set_dirs_with_files(inputs: &ModuleBuildInputs, name: &str) -> Vec<Pat
         .collect();
 }
 
-/// d8 output worth showing, and how many lines of known noise it hid. d8
-/// warns about every class with Kotlin metadata newer than it knows, which is
-/// harmless for dexing.
+/// d8 output worth showing, and how many lines of noise it hid: d8 warns about
+/// every class with Kotlin metadata newer than it knows, harmless for dexing
 fn split_d8_noise(text: &str) -> (Vec<&str>, usize) {
     // a diagnostic starts with Warning/Info/Error and ends at the next one or an empty line
     let mut blocks: Vec<Vec<&str>> = vec![vec![]];

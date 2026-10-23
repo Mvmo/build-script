@@ -42,10 +42,8 @@ impl SymbolTable {
         return Ok(table);
     }
 
-    /// The symbols of `all`, a library linked with its dependencies, that the
-    /// library declares itself: those of `own`, linked without them, and the
-    /// indices of its styleables, which aapt2 only knows with the attributes
-    /// of the dependencies
+    /// The symbols of `all` (the library linked with its dependencies) that the library
+    /// declares: those of `own`, with the styleable indices only `all` knows
     pub fn write_own(all: &SymbolTable, own: &SymbolTable, file: &Path) -> Result<(), String> {
         let styleables: Vec<String> = own
             .symbols
@@ -85,10 +83,8 @@ impl SymbolTable {
     }
 }
 
-/// Writes `package`.R with the resources of `symbols`. With `ids` (the app's
-/// symbols) its fields are final and get the app's ids, like in an apk;
-/// without, they keep the values of `symbols` and are not final, to compile
-/// a library against. Resources the app does not have are left out.
+/// `package`.R for `symbols`. With `ids` (the app's) the fields are final with the app's
+/// ids and resources the app lacks are left out; without, they are for compiling against.
 pub fn write_r_class(
     package: &str,
     symbols: &SymbolTable,
@@ -202,9 +198,8 @@ pub fn binding_class(layout: &str) -> String {
     return name;
 }
 
-/// Java source of a view binding, None for layouts without one. `libraries`
-/// are namespaces and layouts of library modules with view binding, highest
-/// priority first.
+/// Java source of a view binding, None for layouts without one. `libraries`: namespaces
+/// and layouts of library modules with view binding, highest priority first.
 pub fn view_binding_source(
     namespace: &str,
     layout: &str,

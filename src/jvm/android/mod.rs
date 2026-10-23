@@ -163,9 +163,8 @@ fn android_parameters(parameters: FunctionParameters) -> FunctionSignature {
     .returns(Type::Module);
 }
 
-/// A debug apk in build/outputs/apk/debug/<name>-debug.apk: resources with
-/// aapt2, Kotlin against android.jar, dex with d8, aligned and signed with
-/// the debug key
+/// A debug apk in build/outputs/apk/debug/<name>-debug.apk: aapt2, kotlinc against
+/// android.jar, d8, aligned and signed with the debug key
 fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let inputs = read_android_inputs(context, args)?;
     let settings = ApkSettings::of_app(args)?;
@@ -592,9 +591,8 @@ fn android_tests(
     ];
 }
 
-/// Like the Gradle plugin does for libraries, the module and its instrumented tests
-/// are one apk that instruments itself. For an app it keeps the application id, so
-/// it takes the place of the app on the device while the tests run.
+/// The module and its instrumented tests in one apk that instruments itself, like with
+/// Gradle. An app keeps its application id and takes the app's place while tests run.
 fn instrumented_tests(
     context: &BuildScriptContext,
     args: &Arguments,
