@@ -48,7 +48,7 @@ pub enum TokenType {
     LessEq,
     GreaterEq,
 
-    // Parens
+    // Brackets and separators
     LeftParen,
     RightParen,
     LeftBrace,
@@ -159,7 +159,7 @@ pub struct TokenStream<'src> {
 impl<'src> TokenStream<'src> {
     pub fn new(input: &'src str) -> Self {
         return TokenStream {
-            input: input,
+            input,
             current_pos: 0,
         };
     }
@@ -196,26 +196,24 @@ impl<'src> TokenStream<'src> {
             return Token::new(variant, Span::new(start_pos, current_pos));
         };
 
-        let maybe_ident_len = trimmed
+        let mut word_length = trimmed
             .find(|char: char| char.is_whitespace() || char == '"' || CONTROL_CHARS.contains(&char))
-            .unwrap_or_else(|| trimmed.len());
+            .unwrap_or(trimmed.len());
 
-        // a character that only starts a symbol, like a single &: one token, so the parser can name it
-        let maybe_ident_len = if maybe_ident_len == 0 {
-            first_char.len_utf8()
-        } else {
-            maybe_ident_len
-        };
+        // a character that only starts a symbol, like a single &: a token of its own, the parser names it
+        if word_length == 0 {
+            word_length = first_char.len_utf8();
+        }
 
-        let maybe_ident = &trimmed[..maybe_ident_len];
-        current_pos += maybe_ident_len;
+        let word = &trimmed[..word_length];
+        current_pos += word_length;
 
-        if let Some(keyword) = Self::keyword(maybe_ident) {
+        if let Some(keyword) = Self::keyword(word) {
             return Token::new(keyword, Span::new(start_pos, current_pos));
         };
 
         return Token::new(
-            TokenType::Ident(maybe_ident.to_string()),
+            TokenType::Ident(word.to_string()),
             Span::new(start_pos, current_pos),
         );
     }
@@ -231,12 +229,7 @@ impl<'src> TokenStream<'src> {
         return self.lex_token(self.current_pos);
     }
 
-    pub fn eat_next(&mut self) {
-        let _ = self.next();
-    }
-
-    /// Position of the next token: whitespace, `// …` up to the end of the line
-    /// and `/* … */` are skipped
+    /// Position of the next token, after whitespace, `// …` and `/* … */`
     fn skip_whitespace_and_comments(&self, pos: usize) -> usize {
         let mut current_pos = pos;
         loop {
@@ -267,9 +260,9 @@ impl<'src> TokenStream<'src> {
         return None;
     }
 
-    fn keyword(chain: &str) -> Option<TokenType> {
-        for (symbol, token) in KEYWORDS {
-            if *symbol == chain {
+    fn keyword(word: &str) -> Option<TokenType> {
+        for (keyword, token) in KEYWORDS {
+            if *keyword == word {
                 return Some(token.clone());
             }
         }

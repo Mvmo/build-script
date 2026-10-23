@@ -15,7 +15,8 @@ pub type BuiltinFunction = fn(&BuildScriptContext, &Arguments) -> Result<Value, 
 /// Built like `FunctionParameters::new().required("url", Type::String).returns(Type::String)`.
 #[derive(Debug, Clone)]
 pub struct FunctionParameters {
-    pub params: Vec<FunctionParameter>,
+    /// in the order positional arguments bind to them
+    pub fixed: Vec<FunctionParameter>,
     pub variadic: Option<VariadicParameter>,
 }
 
@@ -45,7 +46,7 @@ pub struct VariadicParameter {
 /// The type of a function: its parameters and what it returns
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
-    pub params: FunctionParameters,
+    pub parameters: FunctionParameters,
     pub returns: Type,
 }
 
@@ -98,17 +99,16 @@ pub fn builtin(
     };
 }
 
-/// Assigns the arguments to the parameters like Kotlin does: positional ones in order,
-/// named ones in any order, then defaults for the rest. Like since
-/// Kotlin 1.4, positional arguments may follow named ones as long as those stand at the position of their parameter.
-/// Every argument is checked against the type of its parameter.
+/// Like Kotlin: positional arguments in order, named ones in any order, defaults for
+/// the rest. Positional arguments may follow named ones that stand at the position
+/// of their parameter. Every argument is checked against the type of its parameter.
 pub fn bind(
     function: &str,
-    params: &FunctionParameters,
+    parameters: &FunctionParameters,
     arguments: Vec<CallArgument>,
     span: Span,
 ) -> Result<Arguments, RuntimeError> {
-    let mut slots: Vec<Option<Value>> = vec![None; params.params.len()];
+    let mut slots: Vec<Option<Value>> = vec![None; parameters.fixed.len()];
     let mut rest = vec![];
     let mut rest_named = false;
     let mut named_out_of_place = false;
@@ -132,7 +132,7 @@ pub fn bind(
                     ));
                 }
 
-                if let Some(param) = params.params.get(index) {
+                if let Some(param) = parameters.fixed.get(index) {
                     if !param.param_type.accepts(&value) {
                         return Err(RuntimeError::type_mismatch(
                             function,
@@ -144,7 +144,7 @@ pub fn bind(
                     }
 
                     slots[index] = Some(value);
-                } else if let Some(variadic) = &params.variadic {
+                } else if let Some(variadic) = &parameters.variadic {
                     if !variadic.param_type.accepts(&value) {
                         return Err(RuntimeError::type_mismatch(
                             function,
@@ -159,7 +159,7 @@ pub fn bind(
                 } else {
                     return Err(error(RuntimeErrorType::TooManyArguments {
                         function: function.to_string(),
-                        max: params.params.len(),
+                        max: parameters.fixed.len(),
                         got: positional_count,
                     }));
                 }
@@ -176,10 +176,11 @@ pub fn bind(
                     )
                 };
 
-                if let Some(param_index) = params.params.iter().position(|param| param.name == name)
-                {
+                let position = parameters.fixed.iter().position(|param| param.name == name);
+
+                if let Some(param_index) = position {
                     named_out_of_place |= param_index != index;
-                    let param = &params.params[param_index];
+                    let param = &parameters.fixed[param_index];
 
                     if slots[param_index].is_some() {
                         return Err(duplicate());
@@ -201,13 +202,14 @@ pub fn bind(
 
                 // the variadic parameter takes a list when passed by name
                 named_out_of_place = true;
-                let Some(variadic) = params
+                let Some(variadic) = parameters
                     .variadic
                     .as_ref()
                     .filter(|variadic| variadic.name == name)
                 else {
                     let renamed = Some(snake_case(&name)).filter(|renamed| {
-                        *renamed != name && params.params.iter().any(|param| param.name == *renamed)
+                        *renamed != name
+                            && parameters.fixed.iter().any(|param| param.name == *renamed)
                     });
                     return Err(RuntimeError::new(
                         RuntimeErrorType::UnknownParameter {
@@ -251,9 +253,9 @@ pub fn bind(
         }
     }
 
-    let mut values = Vec::with_capacity(params.params.len());
+    let mut values = Vec::with_capacity(parameters.fixed.len());
 
-    for (param, slot) in params.params.iter().zip(slots) {
+    for (param, slot) in parameters.fixed.iter().zip(slots) {
         let value = match (slot, &param.default) {
             (Some(value), _) => Some(value),
             (None, ParameterDefault::Value(default)) => Some(default.clone()),
@@ -279,7 +281,7 @@ pub fn bind(
 impl FunctionParameters {
     pub fn new() -> Self {
         return FunctionParameters {
-            params: vec![],
+            fixed: vec![],
             variadic: None,
         };
     }
@@ -315,7 +317,7 @@ impl FunctionParameters {
 
     pub fn returns(self, returns: Type) -> FunctionSignature {
         return FunctionSignature {
-            params: self,
+            parameters: self,
             returns,
         };
     }
@@ -327,7 +329,7 @@ impl FunctionParameters {
             "'{name}' comes after the variadic parameter"
         );
 
-        self.params.push(FunctionParameter {
+        self.fixed.push(FunctionParameter {
             name: name.to_string(),
             param_type,
             default,
@@ -337,7 +339,7 @@ impl FunctionParameters {
     }
 
     fn assert_new_name(&self, name: &str) {
-        let taken = self.params.iter().any(|param| param.name == name)
+        let taken = self.fixed.iter().any(|param| param.name == name)
             || self
                 .variadic
                 .as_ref()
@@ -347,25 +349,22 @@ impl FunctionParameters {
     }
 }
 
-impl FunctionParameter {
-    fn is_required(&self) -> bool {
-        return matches!(self.default, ParameterDefault::Required);
-    }
-}
-
 impl FunctionSignature {
     pub fn same_shape(&self, other: &FunctionSignature) -> bool {
-        let same_params = self.params.params.len() == other.params.params.len()
+        let required =
+            |param: &FunctionParameter| matches!(param.default, ParameterDefault::Required);
+
+        let same_params = self.parameters.fixed.len() == other.parameters.fixed.len()
             && self
-                .params
-                .params
+                .parameters
+                .fixed
                 .iter()
-                .zip(&other.params.params)
+                .zip(&other.parameters.fixed)
                 .all(|(left, right)| {
-                    left.param_type == right.param_type && left.is_required() == right.is_required()
+                    left.param_type == right.param_type && required(left) == required(right)
                 });
 
-        let same_variadic = match (&self.params.variadic, &other.params.variadic) {
+        let same_variadic = match (&self.parameters.variadic, &other.parameters.variadic) {
             (Some(left), Some(right)) => left.param_type == right.param_type,
             (None, None) => true,
             _ => false,
@@ -392,8 +391,7 @@ impl Arguments {
         return converted.ok_or_else(|| self.conversion_error::<T>(name));
     }
 
-    /// A list of "name=value" entries, like manifest_placeholders: split at the
-    /// first '=', the name trimmed, the value as it is
+    /// "name=value" entries, like manifest_placeholders: split at the first '=', the name trimmed
     pub fn assignments(&self, name: &str) -> Result<Vec<(String, String)>, String> {
         return self
             .get::<Vec<String>>(name)?
@@ -449,7 +447,7 @@ impl Arguments {
             .collect();
     }
 
-    /// Only happens when declaration and implementation of a builtin disagree
+    /// Only when the declaration and the implementation of a builtin disagree
     fn conversion_error<T>(&self, name: &str) -> String {
         return format!(
             "internal error: argument '{name}' of {} cannot be read as {}",
@@ -537,7 +535,7 @@ impl fmt::Display for FunctionParameter {
 
 impl fmt::Display for FunctionParameters {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut parts: Vec<String> = self.params.iter().map(|param| param.to_string()).collect();
+        let mut parts: Vec<String> = self.fixed.iter().map(|param| param.to_string()).collect();
 
         if let Some(variadic) = &self.variadic {
             parts.push(format!("{}: {}...", variadic.name, variadic.param_type));
@@ -549,7 +547,7 @@ impl fmt::Display for FunctionParameters {
 
 impl fmt::Display for FunctionSignature {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        return write!(f, "fn({}) -> {}", self.params, self.returns);
+        return write!(f, "fn({}) -> {}", self.parameters, self.returns);
     }
 }
 

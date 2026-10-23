@@ -13,9 +13,9 @@ use crate::jvm::JvmLaunch;
 use crate::jvm::maven::{MavenCoordinate, TargetPlatform};
 use crate::jvm::module::{
     Dependencies, ModuleBuildInputs, Sources, dependencies_type, kotlin_and_java_sources,
-    module_params, source_set_dirs,
+    module_parameters, source_set_dirs,
 };
-use crate::jvm::testing::{UnitTests, unit_test_params};
+use crate::jvm::testing::{UnitTests, unit_test_parameters};
 use crate::language::runtime::{
     Arguments, BuildScriptContext, FunctionParameters, FunctionSignature, ModuleTests, TestOutcome,
     TestSuite, Type, Value, builtin,
@@ -59,7 +59,7 @@ pub struct AndroidResources {
 }
 
 pub fn builtins() -> Vec<(&'static str, Value)> {
-    let app = android_params(
+    let app = android_parameters(
         FunctionParameters::new()
             .required("name", Type::String)
             .required("namespace", Type::String)
@@ -76,7 +76,7 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
             .optional("license_report", Type::String),
     );
 
-    let library = android_params(
+    let library = android_parameters(
         FunctionParameters::new()
             .required("name", Type::String)
             .required("namespace", Type::String)
@@ -100,10 +100,10 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
 
 /// Those of build_kotlin and those of Android modules. Debug builds: the debug
 /// source set lies over main, like with the Gradle plugin.
-fn android_params(params: FunctionParameters) -> FunctionSignature {
+fn android_parameters(params: FunctionParameters) -> FunctionSignature {
     let source_sets = &["main", "debug"];
-    return unit_test_params(
-        module_params(params, source_sets, Sources::KotlinAndJava),
+    return unit_test_parameters(
+        module_parameters(params, source_sets, Sources::KotlinAndJava),
         Sources::KotlinAndJava,
     )
     // "name=value" for ${name} in the manifests
@@ -276,7 +276,7 @@ fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Resu
         )?;
 
         // R with non-final ids only to compile against, apps generate the real one
-        build.inputs.log("Linking resources");
+        system::log(&build.inputs.name, "Linking resources");
         let own_resources = build.compile_own_resources()?;
         let symbols = library_symbol_file(&build.inputs);
         build.link_library(&manifest, &own_resources, &intermediates, &symbols)?;
@@ -422,7 +422,7 @@ impl Apk<'_> {
             self.manifest,
         )?;
 
-        build.inputs.log("Linking resources");
+        system::log(&build.inputs.name, "Linking resources");
         let own_resources = build.compile_own_resources()?;
         let symbols = intermediates.join("R.txt");
         let linked = intermediates.join("apk/resources.ap_");
@@ -482,7 +482,7 @@ impl Apk<'_> {
         let generated_resources = build.compile_sources(&[generated.clone()], &classes)?;
         build.build_native_libraries()?;
 
-        build.inputs.log("Dexing");
+        system::log(&build.inputs.name, "Dexing");
 
         let own_jars = vec![
             build.jar(&classes, &intermediates.join("jars/classes.jar"))?,
@@ -504,7 +504,7 @@ impl Apk<'_> {
             build.dex_desugared_library(desugared, &dex_dir, &intermediates.join("desugar/dex"))?;
         }
 
-        build.inputs.log("Packaging");
+        system::log(&build.inputs.name, "Packaging");
         // the app's own Java resources come first, the first jar wins
         let module_resources = intermediates.join("java-resources-module");
         build
@@ -674,7 +674,7 @@ fn instrumented_tests(
 
     // the apk may be up to date, the tests run anyway: their device is an input too
     if fingerprint.is_up_to_date(&[&apk])? {
-        inputs.log("Apk of the instrumented tests up to date");
+        system::log(&inputs.name, "Apk of the instrumented tests up to date");
     } else {
         let build = AndroidBuild::prepare_android_tests(inputs, args)?;
 

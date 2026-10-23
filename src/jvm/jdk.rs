@@ -29,7 +29,7 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
                 .with_default("version", Type::String, DEFAULT_JAVA_VERSION)
                 .with_default("distribution", Type::String, DEFAULT_JDK_DISTRIBUTION)
                 .returns(Type::String),
-            jdk,
+            jdk_directory,
         ),
     )];
 }
@@ -58,7 +58,7 @@ impl Jdk {
             home: project_dir.join(version_or_path),
         };
 
-        if !jdk.tool("java").is_file() {
+        if !jdk.tool_path("java").is_file() {
             return Err(format!(
                 "'{version_or_path}' is neither a java version nor a jdk directory"
             ));
@@ -67,7 +67,7 @@ impl Jdk {
         return Ok(jdk);
     }
 
-    pub fn tool(&self, name: &str) -> PathBuf {
+    pub fn tool_path(&self, name: &str) -> PathBuf {
         return self
             .home
             .join("bin")
@@ -75,8 +75,8 @@ impl Jdk {
     }
 
     /// `java -cp <classpath> <main class>`, the arguments of the program follow
-    pub fn java_main(&self, classpath: &[PathBuf], main_class: &str) -> Result<Command, String> {
-        let mut command = Command::new(self.tool("java"));
+    pub fn java_command(&self, classpath: &[PathBuf], main_class: &str) -> Result<Command, String> {
+        let mut command = Command::new(self.tool_path("java"));
         command
             .arg("-cp")
             .arg(join_classpath(classpath)?)
@@ -114,8 +114,8 @@ impl Jdk {
     }
 }
 
-/// Returns the directory of the JDK
-fn jdk(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
+/// `jdk(...)`: the directory of the JDK, installed if needed
+fn jdk_directory(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let jdk = Jdk::resolve(
         &args.get::<String>("version")?,
         &args.get::<String>("distribution")?,
@@ -198,7 +198,7 @@ fn find_jdk_home(
         home: search_dir.to_path_buf(),
     };
 
-    if candidate.tool("java").is_file() {
+    if candidate.tool_path("java").is_file() {
         return Some(candidate.home);
     }
 
@@ -228,13 +228,13 @@ struct FoojayPlatform {
 
 impl FoojayPlatform {
     fn current() -> Result<Self, String> {
-        let os = match system::host_os()? {
+        let os = match system::host_operating_system()? {
             HostOperatingSystem::MacOs => "macos",
             HostOperatingSystem::Linux => "linux",
             HostOperatingSystem::Windows => "windows",
         };
 
-        let arch = match system::host_arch()? {
+        let arch = match system::host_architecture()? {
             HostArchitecture::Aarch64 => "aarch64",
             HostArchitecture::X86_64 => "x64",
         };
@@ -293,7 +293,7 @@ fn find_jdk_package(
     let (status, body) = system::http_get(&foojay_string(package, &["links", "pkg_info_uri"])?)?;
 
     let package_info_response: Json = serde_json::from_str(&body)
-        .map_err(|error| format!("foojay api respond with HTTP {status}: {error}"))?;
+        .map_err(|error| format!("foojay API responded with HTTP {status}: {error}"))?;
 
     let package_info = package_info_response
         .get("result")

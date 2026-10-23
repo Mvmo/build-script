@@ -10,12 +10,11 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// settings directory
+    /// The file `settings` in the config directory
     pub fn load() -> Result<Self, String> {
         return Self::load_from(system::config_dir().join("settings"));
     }
 
-    // used for testing
     pub fn load_from(file: PathBuf) -> Result<Self, String> {
         let content = if file.is_file() {
             system::read_file(&file)?
@@ -58,7 +57,7 @@ impl Settings {
             .map(|(_, value)| value.as_str());
     }
 
-    // saves to config file
+    /// Saves the file
     pub fn set(&mut self, name: &str, value: &str) -> Result<(), String> {
         let kv_pair = self.entries.iter_mut().find(|(known, _)| known == name);
 
@@ -70,7 +69,7 @@ impl Settings {
         return self.save();
     }
 
-    /// returns false if not set
+    /// False if it was not set
     pub fn remove(&mut self, name: &str) -> Result<bool, String> {
         let before = self.entries.len();
 

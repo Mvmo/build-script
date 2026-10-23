@@ -101,20 +101,6 @@ impl RuntimeError {
         return RuntimeError { variant, span };
     }
 
-    pub fn undefined_variable(name: String, span: Span) -> Self {
-        return Self::new(RuntimeErrorType::UndefinedVariable { name }, span);
-    }
-
-    pub fn invalid_unary_operand(operator: &UnaryOperator, operand: &Value, span: Span) -> Self {
-        return Self::new(
-            RuntimeErrorType::InvalidUnaryOperand {
-                operator: operator.clone(),
-                operand: operand.type_of(),
-            },
-            span,
-        );
-    }
-
     pub fn invalid_binary_operands(
         operator: &BinaryOperator,
         left: &Value,
@@ -126,15 +112,6 @@ impl RuntimeError {
                 operator: operator.clone(),
                 left: left.type_of(),
                 right: right.type_of(),
-            },
-            span,
-        );
-    }
-
-    pub fn not_callable(value: &Value, span: Span) -> Self {
-        return Self::new(
-            RuntimeErrorType::NotCallable {
-                value_type: value.type_of(),
             },
             span,
         );
@@ -158,10 +135,6 @@ impl RuntimeError {
         );
     }
 
-    pub fn unknown_platform(name: String, span: Span) -> Self {
-        return Self::new(RuntimeErrorType::UnknownPlatform { name }, span);
-    }
-
     pub fn builtin_failed(name: &str, message: String, span: Span) -> Self {
         return Self::new(
             RuntimeErrorType::BuiltinFailed {
@@ -171,10 +144,6 @@ impl RuntimeError {
             span,
         );
     }
-
-    pub fn unsupported(feature: String, span: Span) -> Self {
-        return Self::new(RuntimeErrorType::Unsupported { feature }, span);
-    }
 }
 
 /// The message, where it happened is in `span`
@@ -182,7 +151,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self.variant {
             RuntimeErrorType::UndefinedVariable { name } => {
-                // the build functions were called like buildKotlin before
+                // the builtins were called like buildKotlin before
                 let renamed = snake_case(name);
                 if renamed != *name && builtin_names().contains(&renamed.as_str()) {
                     return write!(
@@ -293,7 +262,7 @@ impl fmt::Display for RuntimeError {
     }
 }
 
-/// buildAndroidLibrary -> build_android_library, like the builtins and their parameters were renamed
+/// buildAndroidLibrary -> build_android_library, how the builtins and their parameters were renamed
 pub fn snake_case(name: &str) -> String {
     let mut snake_case = String::new();
 

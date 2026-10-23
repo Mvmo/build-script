@@ -105,9 +105,8 @@ const COMPOSE_LIBRARIES: &[&str] = &[
     r#""androidx.compose.ui:ui""#,
 ];
 
-/// Like the Java naming conventions name packages after a domain: reversed,
-/// characters other than letters and digits become underscores, a keyword gets
-/// one appended and a label that starts with a digit one prefixed: mvmo.dev -> dev.mvmo
+/// Like the Java naming conventions: reversed, other characters than letters and digits
+/// become underscores, keywords and labels starting with a digit get one: mvmo.dev -> dev.mvmo
 pub fn package_of_domain(domain: &str) -> String {
     let segments: Vec<String> = domain
         .split('.')

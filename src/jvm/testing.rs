@@ -68,14 +68,17 @@ pub struct UnitTests<'a> {
     pub classes: Vec<PathBuf>,
     /// whose variants of the libraries the tests get
     pub platform: TargetPlatform,
-    /// of Android modules: compiled against, at runtime after the libraries, like the
-    /// Gradle plugin does it. Its methods throw "Stub!", tests that call them need a fake.
+    /// of Android modules: compiled against, at runtime after the libraries like with
+    /// Gradle. Its methods throw "Stub!", tests that call them need a fake.
     pub android_jar: Option<PathBuf>,
 }
 
 /// Like testImplementation and its kin in Gradle
-pub fn unit_test_params(params: FunctionParameters, sources: Sources) -> FunctionParameters {
-    let mut params = params
+pub fn unit_test_parameters(
+    parameters: FunctionParameters,
+    sources: Sources,
+) -> FunctionParameters {
+    let mut parameters = parameters
         .with_default(
             "test_dependencies",
             dependencies_type(),
@@ -94,11 +97,12 @@ pub fn unit_test_params(params: FunctionParameters, sources: Sources) -> Functio
         );
 
     if sources == Sources::KotlinAndJava {
-        params = params.with_default("test_ksp", dependencies_type(), Value::string_list(&[]));
+        parameters =
+            parameters.with_default("test_ksp", dependencies_type(), Value::string_list(&[]));
     }
 
     // for frameworks without a JUnit Platform engine: started with the test classpath, its exit code decides
-    return params.optional("test_main_class", Type::String);
+    return parameters.optional("test_main_class", Type::String);
 }
 
 impl UnitTests<'_> {
@@ -130,7 +134,7 @@ impl UnitTests<'_> {
         let (kotlin_tests, java_tests) = kotlin_and_java_sources(&test_source_dirs);
 
         if kotlin_tests.is_empty() && java_tests.is_empty() {
-            inputs.log("No tests");
+            system::log(&inputs.name, "No tests");
             return Ok(ModuleTests::Known(TestOutcome::NoTests));
         }
 
@@ -157,7 +161,7 @@ impl UnitTests<'_> {
             inputs.input_fingerprint(&format!("{}-tests", inputs.name), args, &test_inputs)?;
 
         if fingerprint.is_up_to_date(&[])? {
-            inputs.log("Tests up to date");
+            system::log(&inputs.name, "Tests up to date");
             return Ok(ModuleTests::Known(TestOutcome::UpToDate));
         }
 
@@ -222,7 +226,7 @@ impl UnitTests<'_> {
 
         let (mut command, runner) = match test_main_class {
             Some(main_class) => (
-                inputs.jdk.java_main(&runtime_classpath, &main_class)?,
+                inputs.jdk.java_command(&runtime_classpath, &main_class)?,
                 main_class,
             ),
             None => {
@@ -232,7 +236,7 @@ impl UnitTests<'_> {
 
                 let mut command = inputs
                     .jdk
-                    .java_main(&runtime_classpath, CONSOLE_LAUNCHER_MAIN_CLASS)?;
+                    .java_command(&runtime_classpath, CONSOLE_LAUNCHER_MAIN_CLASS)?;
 
                 command
                     .args(console_launcher_options(&version))
@@ -281,9 +285,8 @@ struct TestLibraries {
     symbol_processors: Option<ResolvedSymbolProcessors>,
 }
 
-/// The libraries of the module and of its tests in one resolution, so their
-/// versions agree, plus what the JUnit Platform needs to run the tests and the
-/// processors of the tests. Of aars only their jars count.
+/// The libraries of the module and its tests in one resolution, so versions agree, plus
+/// what the JUnit Platform and the test processors need. Of aars only their jars count.
 fn resolve_test_libraries(
     inputs: &ModuleBuildInputs,
     test_dependencies: &Dependencies,
@@ -455,7 +458,8 @@ fn jars_of_aars(files: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
             continue;
         }
 
-        let target = system::extracted_in_cache(&file)?;
+        let target =
+            system::kept_in_cache("extracted", &file, |target| system::extract(&file, target))?;
         jars.extend(Some(target.join("classes.jar")).filter(|classes| classes.is_file()));
         jars.extend(system::files_with_extension(&[target.join("libs")], "jar"));
     }

@@ -277,11 +277,14 @@ impl AndroidBuild {
         }
 
         let sdk = AndroidSdk::ensure(compile_sdk, &build_tools, accept_license)?;
-        inputs.log(&format!(
-            "Android SDK {} (android-{compile_sdk}, build-tools {build_tools})",
-            sdk.root.display()
-        ));
-        inputs.log(&format!("JDK {}", inputs.jdk.home.display()));
+        system::log(
+            &inputs.name,
+            &format!(
+                "Android SDK {} (android-{compile_sdk}, build-tools {build_tools})",
+                sdk.root.display(),
+            ),
+        );
+        system::log(&inputs.name, &format!("JDK {}", inputs.jdk.home.display()));
 
         let resolved = inputs.resolve(TargetPlatform::Android)?;
         let unpacked = UnpackedLibraries::unpack(&resolved, &sdk, &build_dir)?;
@@ -577,7 +580,7 @@ impl AndroidBuild {
             work_dir: cmake_dir(&self.inputs),
             accept_license: self.accept_license,
         }
-        .run(&|message| self.inputs.log(message));
+        .run(&|message| system::log(&self.inputs.name, message));
     }
 
     /// Those of the libraries and of the module to `output`/lib/<abi>, the module's win
@@ -724,7 +727,7 @@ impl AndroidBuild {
             let mut command = self
                 .inputs
                 .jdk
-                .java_main(&[self.sdk.d8.clone()], "com.android.tools.r8.L8")?;
+                .java_command(&[self.sdk.d8.clone()], "com.android.tools.r8.L8")?;
 
             command
                 .arg("--debug")
@@ -738,7 +741,7 @@ impl AndroidBuild {
                 .arg(&partial)
                 .args(&library.jars);
             system::create_dir(&partial)?;
-            system::run(&mut command, "L8")?;
+            system::run_command(&mut command, "L8")?;
             fs::rename(&partial, &dexed)
                 .map_err(|error| format!("could not move {}: {error}", partial.display()))?;
         }
@@ -764,10 +767,13 @@ impl AndroidBuild {
         // like Android Studio does for debug builds: below API 21 one dex file
         // would have to hold everything, so dex for native multidex instead
         if self.min_api() != self.min_sdk {
-            self.inputs.log(&format!(
-                "Note: min_sdk {} is below {NATIVE_MULTIDEX_API}, the debug apk uses native multidex and needs Android 5.0 or newer",
-                self.min_sdk,
-            ));
+            system::log(
+                &self.inputs.name,
+                &format!(
+                    "Note: min_sdk {} is below {NATIVE_MULTIDEX_API}, the debug apk uses native multidex and needs Android 5.0 or newer",
+                    self.min_sdk,
+                ),
+            );
         }
 
         let modules: HashSet<&PathBuf> = self.module_jars.iter().collect();
@@ -821,7 +827,7 @@ impl AndroidBuild {
         let dex = dexed.join(format!("{:016x}", hasher.finish()));
 
         if dex.is_dir() {
-            self.inputs.log("Libraries dexed before");
+            system::log(&self.inputs.name, "Libraries dexed before");
             return Ok(dex);
         }
 
@@ -831,10 +837,10 @@ impl AndroidBuild {
         system::create_dir(&partial)?;
 
         if !libraries.is_empty() {
-            self.inputs.log(&format!(
-                "Dexing {} libraries, again only when they change",
-                libraries.len()
-            ));
+            system::log(
+                &self.inputs.name,
+                &format!("Dexing {} libraries, again only when they change", libraries.len()),
+            );
             self.run_d8(libraries, &[], &partial, desugared)?;
         }
 
@@ -855,7 +861,7 @@ impl AndroidBuild {
         let mut command = self
             .inputs
             .jdk
-            .java_main(&[self.sdk.d8.clone()], "com.android.tools.r8.D8")?;
+            .java_command(&[self.sdk.d8.clone()], "com.android.tools.r8.D8")?;
 
         command
             .arg("--debug")
@@ -899,9 +905,12 @@ impl AndroidBuild {
         }
 
         if hidden > 0 {
-            self.inputs.log(&format!(
-                "d8: hid {hidden} lines of notes about libraries (Kotlin metadata newer than this d8 knows, stripped debug info)",
-            ));
+            system::log(
+                &self.inputs.name,
+                &format!(
+                    "d8: hid {hidden} lines of notes about libraries (Kotlin metadata newer than this d8 knows, stripped debug info)",
+                ),
+            );
         }
 
         return Ok(());
@@ -928,7 +937,7 @@ impl AndroidBuild {
                 &[dex_dir.to_path_buf()],
                 "dex",
             ));
-        system::run(&mut zip, "adding dex files")?;
+        system::run_command(&mut zip, "adding dex files")?;
 
         if system::contains_files(java_resources) {
             let unaligned = fs::canonicalize(&unaligned).map_err(|error| error.to_string())?;
@@ -937,7 +946,7 @@ impl AndroidBuild {
                 .arg(&unaligned)
                 .arg(".")
                 .current_dir(java_resources);
-            system::run(&mut zip, "adding java resources")?;
+            system::run_command(&mut zip, "adding java resources")?;
         }
 
         // stored and page aligned, so they load from the apk and extractNativeLibs="false" works
@@ -948,7 +957,7 @@ impl AndroidBuild {
                 .arg(&unaligned)
                 .arg("lib")
                 .current_dir(native_libraries);
-            system::run(&mut zip, "adding native libraries")?;
+            system::run_command(&mut zip, "adding native libraries")?;
         }
 
         let _ = fs::remove_file(&aligned);
@@ -967,11 +976,11 @@ impl AndroidBuild {
         };
 
         zipalign.args(["-f", "4"]).arg(&unaligned).arg(&aligned);
-        system::run(&mut zipalign, "zipalign")?;
+        system::run_command(&mut zipalign, "zipalign")?;
 
         system::create_parent_dir(apk)?;
         let keystore = debug_keystore(&self.inputs.jdk)?;
-        let mut sign = Command::new(self.inputs.jdk.tool("java"));
+        let mut sign = Command::new(self.inputs.jdk.tool_path("java"));
         sign.arg("-jar")
             .arg(&self.sdk.apksigner)
             .arg("sign")
@@ -991,10 +1000,10 @@ impl AndroidBuild {
             .arg("--out")
             .arg(apk)
             .arg(&aligned);
-        system::run(&mut sign, "apksigner sign")?;
+        system::run_command(&mut sign, "apksigner sign")?;
 
         // a sanity check, its warnings about META-INF files outside the v2/v3 signature are expected
-        let verify = Command::new(self.inputs.jdk.tool("java"))
+        let verify = Command::new(self.inputs.jdk.tool_path("java"))
             .arg("-jar")
             .arg(&self.sdk.apksigner)
             .arg("verify")
@@ -1067,7 +1076,7 @@ impl AndroidBuild {
             command.arg("-R").arg(compiled);
         }
 
-        return system::run(&mut command, "aapt2 link");
+        return system::run_command(&mut command, "aapt2 link");
     }
 
     /// Java interfaces for the .aidl files, like the Gradle plugin's aidl task.
@@ -1081,8 +1090,10 @@ impl AndroidBuild {
             return Ok(output);
         }
 
-        self.inputs
-            .log(&format!("Generating Java for {} AIDL file(s)", files.len()));
+        system::log(
+            &self.inputs.name,
+            &format!("Generating Java for {} AIDL file(s)", files.len()),
+        );
         for file in &files {
             let mut command = Command::new(&self.sdk.aidl);
             command.arg(format!("-p{}", self.sdk.framework_aidl.display()));
@@ -1092,7 +1103,7 @@ impl AndroidBuild {
             }
 
             command.arg(format!("-o{}", output.display())).arg(file);
-            system::run(&mut command, &format!("aidl {}", file.display()))?;
+            system::run_command(&mut command, &format!("aidl {}", file.display()))?;
         }
 
         return Ok(output);
@@ -1308,7 +1319,7 @@ impl UnpackedLibraries {
         for file in &resolved.compile_only {
             if is_aar(file) {
                 unpacked.compile_only.extend(system::files_with_extension(
-                    &[system::extracted_in_cache(file)?],
+                    &[system::kept_in_cache("extracted", file, |target| system::extract(file, target))?],
                     "jar",
                 ));
             } else {
@@ -1331,7 +1342,7 @@ impl UnpackedLibraries {
             .to_string_lossy()
             .to_string();
 
-        let target = system::extracted_in_cache(aar)?;
+        let target = system::kept_in_cache("extracted", aar, |target| system::extract(aar, target))?;
 
         let classes = target.join("classes.jar");
 
@@ -1471,11 +1482,11 @@ impl CMakeBuild<'_> {
                     "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}",
                     libraries.join(abi).display()
                 ));
-            system::run(&mut configure, &format!("cmake for {abi}"))?;
+            system::run_command(&mut configure, &format!("cmake for {abi}"))?;
 
             let mut build = Command::new(&cmake);
             build.arg("--build").arg(&build_dir);
-            system::run(&mut build, &format!("native build for {abi}"))?;
+            system::run_command(&mut build, &format!("native build for {abi}"))?;
         }
 
         return Ok(());
@@ -1542,7 +1553,7 @@ fn compile_resources(aapt2: &Path, res_dir: &Path, output: &Path) -> Result<(), 
         .arg(res_dir)
         .arg("-o")
         .arg(&partial);
-    system::run(
+    system::run_command(
         &mut command,
         &format!("aapt2 compile of {}", res_dir.display()),
     )?;
@@ -1616,7 +1627,7 @@ fn debug_keystore(jdk: &Jdk) -> Result<PathBuf, String> {
     }
 
     system::create_parent_dir(&keystore)?;
-    let mut command = Command::new(jdk.tool("keytool"));
+    let mut command = Command::new(jdk.tool_path("keytool"));
     command
         .arg("-genkeypair")
         .arg("-keystore")
@@ -1631,7 +1642,7 @@ fn debug_keystore(jdk: &Jdk) -> Result<PathBuf, String> {
         ])
         .args(["-keyalg", "RSA", "-keysize", "2048", "-validity", "10000"])
         .args(["-dname", "CN=Android Debug,O=Android,C=US"]);
-    system::run(&mut command, "keytool")?;
+    system::run_command(&mut command, "keytool")?;
 
     return Ok(keystore);
 }

@@ -67,8 +67,7 @@ pub fn project_kinds() -> Vec<&'static str> {
 }
 
 /// A new directory with a project.build and the modules of the kind, like cargo new.
-/// `package` is the package of the sources, modules in directories get their own below
-/// it. Without it the package is the project's name below the domain `domain` gives.
+/// `package` names the sources, else the project below the domain `domain` gives.
 pub fn new_project(
     kind: &str,
     path: &Path,
@@ -285,9 +284,8 @@ pub fn clean(script_file: &Path) -> Result<(), String> {
     return Ok(());
 }
 
-/// The developer's domain, which the names of new modules start with in every
-/// language: the remembered one, else asked for in a terminal and offered to
-/// remember, else example.com
+/// The developer's domain new modules are named after: the remembered one, else asked
+/// in a terminal and offered to remember, else example.com
 pub fn domain() -> Result<String, String> {
     let mut settings = Settings::load()?;
 

@@ -48,19 +48,19 @@ pub fn parse(input: &str) -> Result<XmlElement, String> {
 
         match event {
             Event::Start(start) => {
-                stack.push(element(&start).map_err(|cause| error(&reader, &cause))?)
+                stack.push(element_of_tag(&start).map_err(|cause| error(&reader, &cause))?)
             }
             Event::Empty(start) => {
-                let element = element(&start).map_err(|cause| error(&reader, &cause))?;
-                current(&mut stack).children.push(element);
+                let element = element_of_tag(&start).map_err(|cause| error(&reader, &cause))?;
+                open_element(&mut stack).children.push(element);
             }
             // the reader checks that end tags match their start tags
             Event::End(_) => {
                 let element = stack.pop().expect("an end tag follows its start tag");
-                current(&mut stack).children.push(element);
+                open_element(&mut stack).children.push(element);
             }
-            Event::Text(text) => current(&mut stack).text.push_str(&text.xml10_content()),
-            Event::CData(data) => current(&mut stack).text.push_str(&data.xml10_content()),
+            Event::Text(text) => open_element(&mut stack).text.push_str(&text.xml10_content()),
+            Event::CData(data) => open_element(&mut stack).text.push_str(&data.xml10_content()),
             Event::GeneralRef(reference) => {
                 let name = reference.xml10_content();
                 let resolved = match reference
@@ -74,7 +74,7 @@ pub fn parse(input: &str) -> Result<XmlElement, String> {
                         .unwrap_or_else(|| format!("&{name};")),
                 };
 
-                current(&mut stack).text.push_str(&resolved);
+                open_element(&mut stack).text.push_str(&resolved);
             }
             Event::Eof => break,
             Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_) => {}
@@ -82,7 +82,7 @@ pub fn parse(input: &str) -> Result<XmlElement, String> {
     }
 
     if stack.len() != 1 {
-        return Err(format!("<{}> is never closed", current(&mut stack).name));
+        return Err(format!("<{}> is never closed", open_element(&mut stack).name));
     }
 
     return stack
@@ -107,7 +107,7 @@ pub fn write(element: &XmlElement, skip: &dyn Fn(&str) -> bool) -> String {
     return out;
 }
 
-fn element(start: &BytesStart) -> Result<XmlElement, quick_xml::Error> {
+fn element_of_tag(start: &BytesStart) -> Result<XmlElement, quick_xml::Error> {
     let mut attributes = vec![];
 
     for attribute in start.attributes() {
@@ -123,7 +123,8 @@ fn element(start: &BytesStart) -> Result<XmlElement, quick_xml::Error> {
     });
 }
 
-fn current(stack: &mut [XmlElement]) -> &mut XmlElement {
+/// The innermost element not closed yet
+fn open_element(stack: &mut [XmlElement]) -> &mut XmlElement {
     return stack
         .last_mut()
         .expect("the document element is always on the stack");

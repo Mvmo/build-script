@@ -12,9 +12,9 @@ use super::JvmLaunch;
 use super::maven::TargetPlatform;
 use super::module::{
     Compilation, ModuleBuildInputs, Sources, classes_kind, create_jar, dependencies_type,
-    kotlin_and_java_sources, module_params,
+    kotlin_and_java_sources, module_parameters,
 };
-use super::testing::{UnitTests, unit_test_params};
+use super::testing::{UnitTests, unit_test_parameters};
 
 /// `use kotlin`
 pub fn kotlin_builtins() -> Vec<(&'static str, Value)> {
@@ -22,7 +22,7 @@ pub fn kotlin_builtins() -> Vec<(&'static str, Value)> {
         "build_kotlin",
         builtin(
             "build_kotlin",
-            jar_params(Sources::KotlinAndJava),
+            jar_parameters(Sources::KotlinAndJava),
             |context, args| build_module(context, args, Sources::KotlinAndJava),
         ),
     )];
@@ -32,15 +32,15 @@ pub fn kotlin_builtins() -> Vec<(&'static str, Value)> {
 pub fn java_builtins() -> Vec<(&'static str, Value)> {
     return vec![(
         "build_java",
-        builtin("build_java", jar_params(Sources::Java), |context, args| {
+        builtin("build_java", jar_parameters(Sources::Java), |context, args| {
             build_module(context, args, Sources::Java)
         }),
     )];
 }
 
-fn jar_params(sources: Sources) -> FunctionSignature {
-    return unit_test_params(
-        module_params(
+fn jar_parameters(sources: Sources) -> FunctionSignature {
+    return unit_test_parameters(
+        module_parameters(
             FunctionParameters::new()
                 .required("name", Type::String)
                 .required("dependencies", dependencies_type())
@@ -91,7 +91,7 @@ fn build_module(
 
     // only jars with a Main-Class can be started
     let launch = main_class.map(|_| JvmLaunch::Jar {
-        java: inputs.jdk.tool("java"),
+        java: inputs.jdk.tool_path("java"),
     });
 
     return Ok(Value::from(inputs.built_module(
@@ -143,7 +143,7 @@ fn build_jar(
         return Ok(jar);
     }
 
-    inputs.log(&format!("JDK {}", inputs.jdk.home.display()));
+    system::log(&inputs.name, &format!("JDK {}", inputs.jdk.home.display()));
     let resolved = inputs.resolve(TargetPlatform::Jvm)?;
 
     if let Some(aar) = resolved

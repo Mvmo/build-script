@@ -60,7 +60,7 @@ pub fn install_and_start(
     install
         .args(["-s", &device, "install", "-r", "-t"])
         .arg(apk);
-    system::run(&mut install, "adb install")?;
+    system::run_command(&mut install, "adb install")?;
 
     println!("Starting {application_id}/{activity}");
     let mut start = Command::new(&adb);
@@ -75,7 +75,7 @@ pub fn install_and_start(
         &format!("{application_id}/{activity}"),
     ]);
 
-    return system::run(&mut start, "adb shell am start");
+    return system::run_command(&mut start, "adb shell am start");
 }
 
 impl TestRunner for InstrumentedTests {
@@ -657,7 +657,7 @@ fn create_avd(home: &Path, image: &SystemImage) -> Result<String, String> {
 
 /// The ABI system images need to run fast on this machine
 fn host_abi() -> &'static str {
-    match system::host_arch() {
+    match system::host_architecture() {
         Ok(HostArchitecture::Aarch64) => return "arm64-v8a",
         _ => return "x86_64",
     }

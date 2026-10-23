@@ -1,6 +1,6 @@
 // The host: where build-script keeps its data, files and directories, processes, downloads and archives
 use std::collections::hash_map::DefaultHasher;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BUILD_SCRIPT_DIR_NAME: &str = "build-script";
-/// below the user's home, when neither BUILD_SCRIPT_HOME nor XDG is set
+/// In the user's home, when neither BUILD_SCRIPT_HOME nor XDG is set
 const DEFAULT_BUILD_SCRIPT_HOME_DIR_NAME: &str = ".build-script";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,7 +26,7 @@ pub enum HostArchitecture {
     X86_64,
 }
 
-pub fn host_os() -> Result<HostOperatingSystem, String> {
+pub fn host_operating_system() -> Result<HostOperatingSystem, String> {
     match std::env::consts::OS {
         "macos" => return Ok(HostOperatingSystem::MacOs),
         "linux" => return Ok(HostOperatingSystem::Linux),
@@ -35,7 +35,7 @@ pub fn host_os() -> Result<HostOperatingSystem, String> {
     }
 }
 
-pub fn host_arch() -> Result<HostArchitecture, String> {
+pub fn host_architecture() -> Result<HostArchitecture, String> {
     match std::env::consts::ARCH {
         "aarch64" => return Ok(HostArchitecture::Aarch64),
         "x86_64" => return Ok(HostArchitecture::X86_64),
@@ -43,26 +43,22 @@ pub fn host_arch() -> Result<HostArchitecture, String> {
     }
 }
 
-/// JDKs, the Android SDK and emulators: below $BUILD_SCRIPT_HOME, $XDG_DATA_HOME/build-script or ~/.build-script
+/// JDKs, the Android SDK and emulators
 pub fn data_dir(name: &str) -> PathBuf {
-    return BuildHomeEnvironment::read().base_dir(BaseDirectory::Data).join(name);
+    return BuildHomeEnvironment::read().base_directory(BaseDirectory::Data).join(name);
 }
 
 /// Downloaded artifacts, like ~/.gradle/caches
 pub fn cache_dir(name: &str) -> PathBuf {
-    return BuildHomeEnvironment::read().base_dir(BaseDirectory::Cache).join(name);
+    return BuildHomeEnvironment::read().base_directory(BaseDirectory::Cache).join(name);
 }
 
-/// personal configurations: below $BUILD_SCRIPT_HOME, $XDG_CONFIG_HOME/build-script or ~/.build-script
+/// The settings
 pub fn config_dir() -> PathBuf {
-    return BuildHomeEnvironment::read().base_dir(BaseDirectory::Config);
+    return BuildHomeEnvironment::read().base_directory(BaseDirectory::Config);
 }
 
-pub fn user_home_dir() -> PathBuf {
-    return home_or_current_dir(std::env::var_os("HOME").as_deref());
-}
-
-/// A line of the build log, prefixed with what it is about: `[app] Compiling`
+/// A line of the build log: `[app] Compiling`
 pub fn log(source: &str, message: &str) {
     println!("[{source}] {message}");
 }
@@ -208,9 +204,9 @@ pub fn contains_files(directory: &Path) -> bool {
     });
 }
 
-/// Runs a tool with inherited output, `what` names it in errors. Tools get no
-/// stdin, so they cannot swallow what the user types for a prompt.
-pub fn run(command: &mut Command, what: &str) -> Result<(), String> {
+/// With the output in the terminal, but no stdin: a tool must not swallow what
+/// the user types for a prompt. `what` names it in errors.
+pub fn run_command(command: &mut Command, what: &str) -> Result<(), String> {
     let status = command.stdin(Stdio::null()).status().map_err(|error| {
         format!(
             "could not start {}: {error}",
@@ -225,8 +221,7 @@ pub fn run(command: &mut Command, what: &str) -> Result<(), String> {
     return Ok(());
 }
 
-/// For servers that want a user name and password. Deliberately no Debug, so
-/// the password cannot end up in a log.
+/// For servers that want a user name and password. No Debug, the password must not end up in a log.
 pub struct Credentials {
     pub username: String,
     pub password: String,
@@ -241,7 +236,7 @@ pub fn download(
 ) -> Result<bool, String> {
     create_parent_dir(target)?;
 
-    // renamed once complete, so no partial files are left behind
+    // renamed once complete, nothing half downloaded stays behind
     let partial = partial_path(target);
     let mut command = Command::new("curl");
     command
@@ -264,7 +259,7 @@ pub fn download(
         command.arg("--silent").stderr(Stdio::piped());
     }
 
-    // on stdin as a config file, arguments are visible to every process on the machine
+    // on stdin: arguments are visible to every process on the machine
     match credentials {
         Some(_) => command.args(["--config", "-"]).stdin(Stdio::piped()),
         None => command.stdin(Stdio::null()),
@@ -329,8 +324,7 @@ pub fn download(
     }
 }
 
-/// `checksum`: SHA-1 or SHA-256 bits and the expected hex string. A file that
-/// does not match is deleted.
+/// `checksum`: the SHA bits (1 or 256) and the expected hex string. A file that does not match is deleted.
 pub fn download_verified(
     url: &str,
     target: &Path,
@@ -355,7 +349,7 @@ pub fn download_verified(
     return Ok(true);
 }
 
-/// Downloads an archive and extracts it to `unpacked`, the archive itself is deleted afterwards
+/// Downloads an archive and extracts it to `unpacked`, then deletes the archive
 pub fn download_and_extract(
     url: &str,
     archive: &Path,
@@ -409,8 +403,7 @@ pub fn http_get(url: &str) -> Result<(u16, String), String> {
     return Ok((status, body.to_string()));
 }
 
-/// SHA-1 or SHA-256 (`bits` 1 or 256) as hex string, with shasum on macOS and
-/// sha1sum/sha256sum on Linux
+/// SHA-1 or SHA-256 as hex: shasum on macOS, sha1sum and sha256sum on Linux
 pub fn sha(file: &Path, bits: u32) -> Result<String, String> {
     let shasum_args = ["-a".to_string(), bits.to_string()];
     let tools: [(String, &[String]); 2] = [
@@ -460,20 +453,13 @@ pub fn extract(archive: &Path, target: &Path) -> Result<(), String> {
         command
     };
 
-    run(&mut command, &format!("extracting {}", archive.display()))?;
+    run_command(&mut command, &format!("extracting {}", archive.display()))?;
     make_accessible(target);
 
     return Ok(());
 }
 
-/// An archive that never changes, like a released aar in the Maven cache,
-/// extracted once into the cache. Returns the directory.
-pub fn extracted_in_cache(archive: &Path) -> Result<PathBuf, String> {
-    return kept_in_cache("extracted", archive, |target| extract(archive, target));
-}
-
-/// The directory `produce` makes of a file that never changes, made once and
-/// kept in the cache below `name`
+/// The directory `produce` makes of a file that never changes, made once and kept in the cache
 pub fn kept_in_cache(
     name: &str,
     file: &Path,
@@ -493,7 +479,6 @@ pub fn kept_in_cache(
 
     // renamed once complete, a build that stops half way leaves nothing behind
     let partial = partial_path(&target);
-
     remove_dir(&partial)?;
     produce(&partial)?;
     match fs::rename(&partial, &target) {
@@ -513,9 +498,8 @@ pub fn kept_in_cache(
     }
 }
 
-/// Where a file or directory is written before it is complete and renamed to
-/// `path`, its own for every caller: builds on several threads may write the same
-/// file at the same time, like an artifact two modules need
+/// Where `path` is written before it is complete and renamed. A new one each
+/// call: modules building at the same time may write the same file.
 pub fn partial_path(path: &Path) -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let next = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -527,8 +511,7 @@ pub fn partial_path(path: &Path) -> PathBuf {
     ));
 }
 
-/// One installation at a time: builds on several threads may need the same JDK or
-/// SDK package, the one after the first finds it installed
+/// One installation at a time: modules building at the same time may need the same JDK or SDK package
 pub fn installing<T>(install: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     static INSTALLING: Mutex<()> = Mutex::new(());
     let _installing = INSTALLING
@@ -538,7 +521,6 @@ pub fn installing<T>(install: impl FnOnce() -> Result<T, String>) -> Result<T, S
     return install();
 }
 
-/// One file of a zip archive, like a configuration inside a jar
 /// The names of the entries of a zip archive, like a jar
 pub fn zip_entries(archive: &Path) -> Result<Vec<String>, String> {
     let output = Command::new("unzip")
@@ -558,6 +540,7 @@ pub fn zip_entries(archive: &Path) -> Result<Vec<String>, String> {
         .collect());
 }
 
+/// One file of a zip archive, like a configuration inside a jar
 pub fn read_zip_entry(archive: &Path, entry: &str) -> Result<Vec<u8>, String> {
     let output = Command::new("unzip")
         .arg("-p")
@@ -602,10 +585,9 @@ impl BuildHomeEnvironment {
         };
     }
 
-    /// $BUILD_SCRIPT_HOME keeps everything in one directory with the caches in
-    /// caches/, like ~/.gradle. Without it $XDG_DATA_HOME, $XDG_CACHE_HOME and
-    /// $XDG_CONFIG_HOME decide, each one that is not set falls back to ~/.build-script.
-    fn base_dir(&self, base_dir_type: BaseDirectory) -> PathBuf {
+    /// $BUILD_SCRIPT_HOME keeps everything in one directory, the caches in caches/
+    /// like ~/.gradle. Without it the XDG variables decide, ~/.build-script for those not set.
+    fn base_directory(&self, kind: BaseDirectory) -> PathBuf {
         let build_script_home = self
             .build_script_home
             .as_deref()
@@ -613,7 +595,7 @@ impl BuildHomeEnvironment {
             .map(PathBuf::from);
 
         if build_script_home.is_none() {
-            let xdg_base_dir = match base_dir_type {
+            let xdg_base_dir = match kind {
                 BaseDirectory::Data => self.xdg_data_home.as_deref(),
                 BaseDirectory::Cache => self.xdg_cache_home.as_deref(),
                 BaseDirectory::Config => self.xdg_config_home.as_deref(),
@@ -629,20 +611,15 @@ impl BuildHomeEnvironment {
         }
 
         let build_script_home = build_script_home.unwrap_or_else(|| {
-            home_or_current_dir(self.home.as_deref()).join(DEFAULT_BUILD_SCRIPT_HOME_DIR_NAME)
+            let home = self.home.as_deref().map_or(PathBuf::from("."), PathBuf::from);
+            home.join(DEFAULT_BUILD_SCRIPT_HOME_DIR_NAME)
         });
 
-        return match base_dir_type {
+        return match kind {
             BaseDirectory::Data | BaseDirectory::Config => build_script_home,
             BaseDirectory::Cache => build_script_home.join("caches"),
         };
     }
-}
-
-fn home_or_current_dir(home: Option<&OsStr>) -> PathBuf {
-    return home
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
 }
 
 #[cfg(test)]
@@ -658,8 +635,8 @@ mod tests {
 
     fn base_dirs(env: BuildHomeEnvironment) -> (PathBuf, PathBuf) {
         return (
-            env.base_dir(BaseDirectory::Data),
-            env.base_dir(BaseDirectory::Cache),
+            env.base_directory(BaseDirectory::Data),
+            env.base_directory(BaseDirectory::Cache),
         );
     }
 
@@ -709,7 +686,7 @@ mod tests {
 
         // settings go with the data, or to $XDG_CONFIG_HOME
         assert_eq!(
-            home_a().base_dir(BaseDirectory::Config),
+            home_a().base_directory(BaseDirectory::Config),
             PathBuf::from("/home/a/.build-script")
         );
         assert_eq!(
@@ -717,7 +694,7 @@ mod tests {
                 xdg_config_home: Some("/config".into()),
                 ..home_a()
             }
-            .base_dir(BaseDirectory::Config),
+            .base_directory(BaseDirectory::Config),
             PathBuf::from("/config/build-script")
         );
 

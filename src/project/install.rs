@@ -36,13 +36,6 @@ pub fn install(
     let calls = script::module_calls(&script);
     let call = chosen_module(&calls, module, script_file)?;
 
-    if !matches!(call.platform, "kotlin" | "java" | "android") {
-        return Err(format!(
-            "install brings Maven libraries to kotlin, java and android modules, {} is a {} module",
-            call.name, call.platform
-        ));
-    }
-
     if !call.has_parameter(parameter) {
         return Err(format!(
             "{} of {} takes no {parameter}",
@@ -163,8 +156,8 @@ fn argument_value<T: FromValue>(
 ) -> Result<T, String> {
     let default = || {
         call.signature
-            .params
-            .params
+            .parameters
+            .fixed
             .iter()
             .find(|param| param.name == parameter)
             .and_then(|param| match &param.default {

@@ -14,7 +14,7 @@ use crate::common::system;
 #[derive(Debug)]
 pub struct InputFingerprint {
     hasher: DefaultHasher,
-    /// keeps the fingerprint of the last successful build
+    /// holds the fingerprint of the last successful build
     file: PathBuf,
 }
 
@@ -38,18 +38,17 @@ impl InputFingerprint {
         value.hash(&mut self.hasher);
     }
 
-    /// Paths and contents of the files, and of all files below the directories.
-    /// A missing path counts too, so creating it later changes the fingerprint.
+    /// Paths and contents of the files and of all files below the directories. A
+    /// missing path counts too: creating it later changes the fingerprint.
     pub fn add_files(&mut self, paths: &[PathBuf]) -> Result<(), String> {
         return hash_files(paths, &mut self.hasher);
     }
 
-    /// Whether all outputs exist and the last successful build had this
-    /// fingerprint. If not, that fingerprint is forgotten before building: a
-    /// build that fails half way must not count as up to date.
+    /// Whether all outputs exist and the last successful build had this fingerprint.
+    /// If not, the stored one is deleted: a build that fails half way is not up to date.
     pub fn is_up_to_date(&self, outputs: &[&Path]) -> Result<bool, String> {
         let up_to_date = outputs.iter().all(|output| output.exists())
-            && fs::read_to_string(&self.file).is_ok_and(|stored| stored.trim() == self.value());
+            && fs::read_to_string(&self.file).is_ok_and(|stored| stored.trim() == self.hex());
 
         if up_to_date {
             return Ok(true);
@@ -64,16 +63,15 @@ impl InputFingerprint {
 
     /// Once the build succeeded
     pub fn store(&self) -> Result<(), String> {
-        return system::write_file(&self.file, &self.value());
+        return system::write_file(&self.file, &self.hex());
     }
 
-    fn value(&self) -> String {
+    fn hex(&self) -> String {
         return format!("{:016x}", self.hasher.finish());
     }
 }
 
-/// Paths and contents like InputFingerprint::add_files, as the key of outputs
-/// that are kept until their inputs change
+/// Like InputFingerprint::add_files: the key of outputs kept until their inputs change
 pub fn files_hash(paths: &[PathBuf]) -> Result<u64, String> {
     let mut hasher = DefaultHasher::new();
     hash_files(paths, &mut hasher)?;
@@ -100,12 +98,11 @@ fn hash_files(paths: &[PathBuf], hasher: &mut DefaultHasher) -> Result<(), Strin
 }
 
 thread_local! {
-    /// Of the files this run read, by path, length and modification time: the
-    /// jars and res directories of a library are inputs of every module above it
+    /// By path, length and modification time: the jars of a library are inputs of every module above it
     static CONTENT_HASHES: RefCell<HashMap<(PathBuf, u64, Option<SystemTime>), u64>> = RefCell::new(HashMap::new());
 }
 
-/// Read in chunks, a jar does not have to fit in memory as a whole
+/// Read in chunks, a jar need not fit in memory
 fn content_hash(file: &Path) -> Result<u64, String> {
     let error = |error: std::io::Error| format!("could not read {}: {error}", file.display());
     let metadata = fs::metadata(file).map_err(error)?;

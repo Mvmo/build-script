@@ -36,7 +36,8 @@ macro_rules! expect_token {
 #[derive(Debug)]
 pub enum ParseErrorType {
     UnexpectedToken {
-        expected: Vec<String>, // or
+        /// alternatives
+        expected: Vec<String>,
         got: Option<Token>,
     },
     InvalidAssignmentTarget,
@@ -53,13 +54,6 @@ impl ParseError {
         return ParseError {
             variant: ParseErrorType::UnexpectedToken { expected, got },
             span,
-        };
-    }
-
-    fn invalid_assignment_target(target: Expression) -> Self {
-        return ParseError {
-            variant: ParseErrorType::InvalidAssignmentTarget,
-            span: target.span,
         };
     }
 }
@@ -179,7 +173,7 @@ pub struct TypeExpression {
 
 #[derive(Debug, Clone)]
 pub struct Identifier {
-    pub str: String,
+    pub name: String,
     pub span: Span,
 }
 
@@ -191,9 +185,7 @@ pub struct Parameter {
     pub default: Option<Expression>,
 }
 
-// examples:
-// ident: use kotlin
-// filepath: use "otherscript"
+/// `use kotlin`, or a script: `use "other.build"`
 #[derive(Debug)]
 pub enum UseTarget {
     Ident(Identifier),
@@ -212,20 +204,17 @@ pub struct Statement {
     pub span: Span,
 }
 
-impl Statement {
-    fn new(variant: StatementType, span: Span) -> Self {
-        return Statement { variant, span };
-    }
-}
-
 #[derive(Debug)]
 pub struct Script {
     pub statements: Vec<Statement>,
 }
 
-const PREFIX_PRECEDENCE: u8 = 15; // -x, !x
-const CALL_PRECEDENCE: u8 = 17; // f(x)
-const NO_ASSIGNMENT_PRECEDENCE: u8 = 3; // everything binding tighter than =, for defaults
+/// -x, !x
+const PREFIX_PRECEDENCE: u8 = 15;
+/// f(x)
+const CALL_PRECEDENCE: u8 = 17;
+/// everything that binds tighter than =, for default values
+const NO_ASSIGNMENT_PRECEDENCE: u8 = 3;
 
 const fn infix_precedence(variant: &TokenType) -> Option<(u8, u8)> {
     return Some(match variant {
@@ -257,17 +246,18 @@ impl<'src> Parser<'src> {
         return Ok(Script { statements });
     }
 
-    // statement parsers
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
-        match self.token_stream.peek().variant {
-            TokenType::Use => return self.parse_use_statement(),
-            _ => {
-                let expression = self.parse_expression(0)?;
-                let span = expression.span;
-
-                return Ok(Statement::new(StatementType::Expression(expression), span));
-            }
+        if self.token_stream.peek().variant == TokenType::Use {
+            return self.parse_use_statement();
         }
+
+        let expression = self.parse_expression(0)?;
+        let span = expression.span;
+
+        return Ok(Statement {
+            variant: StatementType::Expression(expression),
+            span,
+        });
     }
 
     fn parse_use_statement(&mut self) -> Result<Statement, ParseError> {
@@ -276,8 +266,8 @@ impl<'src> Parser<'src> {
         let token = self.token_stream.next();
 
         let target = match token.variant {
-            TokenType::Ident(str) => UseTarget::Ident(Identifier {
-                str,
+            TokenType::Ident(name) => UseTarget::Ident(Identifier {
+                name,
                 span: token.span,
             }),
             TokenType::String(path) => UseTarget::FilePath {
@@ -293,10 +283,10 @@ impl<'src> Parser<'src> {
             }
         };
 
-        return Ok(Statement::new(
-            StatementType::Use(target),
-            use_token.span.till(token.span),
-        ));
+        return Ok(Statement {
+            variant: StatementType::Use(target),
+            span: use_token.span.till(token.span),
+        });
     }
 
     fn parse_expression(&mut self, min_precedence: u8) -> Result<Expression, ParseError> {
@@ -323,7 +313,7 @@ impl<'src> Parser<'src> {
                 break;
             }
 
-            self.token_stream.eat_next();
+            self.token_stream.next();
             let right_expression = self.parse_expression(right_precedence)?;
 
             left_expression =
@@ -378,13 +368,14 @@ impl<'src> Parser<'src> {
         let mut params = vec![];
 
         while self.token_stream.peek().variant != TokenType::RightParen {
-            let name = self.parse_identifier()?;
+            let (name, span) = expect_token!(self, TokenType::Ident(name) => name)?;
+            let name = Identifier { name, span };
             expect_token!(self, TokenType::Colon)?;
             let param_type = self.parse_type()?;
 
             let default = match self.token_stream.peek().variant {
                 TokenType::Eq => {
-                    self.token_stream.eat_next();
+                    self.token_stream.next();
                     Some(self.parse_expression(NO_ASSIGNMENT_PRECEDENCE)?)
                 }
                 _ => None,
@@ -400,14 +391,14 @@ impl<'src> Parser<'src> {
                 break;
             }
 
-            self.token_stream.eat_next();
+            self.token_stream.next();
         }
 
         expect_token!(self, TokenType::RightParen)?;
 
         let returns = match self.token_stream.peek().variant {
             TokenType::Arrow => {
-                self.token_stream.eat_next();
+                self.token_stream.next();
                 Some(self.parse_type()?)
             }
             _ => None,
@@ -431,11 +422,11 @@ impl<'src> Parser<'src> {
 
         let otherwise = match self.token_stream.peek().variant {
             TokenType::Else => {
-                self.token_stream.eat_next();
+                self.token_stream.next();
                 let else_token = self.token_stream.peek();
 
                 if else_token.variant == TokenType::If {
-                    self.token_stream.eat_next();
+                    self.token_stream.next();
                     let nested = self.parse_if(else_token.span)?;
                     close = nested.span;
                     Some(vec![nested])
@@ -486,7 +477,7 @@ impl<'src> Parser<'src> {
         let mut members = vec![first];
 
         while self.token_stream.peek().variant == TokenType::Pipe {
-            self.token_stream.eat_next();
+            self.token_stream.next();
             members.push(self.parse_single_type()?);
         }
 
@@ -527,7 +518,7 @@ impl<'src> Parser<'src> {
                         break;
                     }
 
-                    self.token_stream.eat_next();
+                    self.token_stream.next();
                 }
 
                 expect_token!(self, TokenType::RightParen)?;
@@ -582,7 +573,7 @@ impl<'src> Parser<'src> {
                     break;
                 }
 
-                self.token_stream.eat_next();
+                self.token_stream.next();
 
                 // allows a comma after the last argument
                 if self.token_stream.peek().variant == TokenType::RightParen {
@@ -612,9 +603,16 @@ impl<'src> Parser<'src> {
 
         let operator = match operator_token.variant {
             TokenType::Eq => {
+                if !matches!(left.variant, ExpressionType::Ident(_)) {
+                    return Err(ParseError {
+                        variant: ParseErrorType::InvalidAssignmentTarget,
+                        span: left.span,
+                    });
+                }
+
                 return Ok(Expression {
                     variant: ExpressionType::Assignment {
-                        target: Box::new(Self::try_into_assignment_target(left)?),
+                        target: Box::new(left),
                         value: Box::new(right),
                     },
                     span,
@@ -643,17 +641,5 @@ impl<'src> Parser<'src> {
             },
             span,
         });
-    }
-
-    fn try_into_assignment_target(expression: Expression) -> Result<Expression, ParseError> {
-        match expression.variant {
-            ExpressionType::Ident(_) => Ok(expression),
-            _ => return Err(ParseError::invalid_assignment_target(expression.clone())),
-        }
-    }
-
-    fn parse_identifier(&mut self) -> Result<Identifier, ParseError> {
-        let (str, span) = expect_token!(self, TokenType::Ident(ident) => ident)?;
-        return Ok(Identifier { str, span });
     }
 }

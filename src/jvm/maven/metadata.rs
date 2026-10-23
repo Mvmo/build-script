@@ -93,7 +93,7 @@ pub fn fetch(
             for name in ["maven-metadata-local.xml", "maven-metadata.xml"] {
                 let file = root.join(directory).join(name);
                 if file.is_file() {
-                    return parsed(&file).map(Some);
+                    return read_metadata_file(&file).map(Some);
                 }
             }
             return Ok(None);
@@ -137,10 +137,10 @@ pub fn fetch(
         }
     }
 
-    return parsed(&cached).map(Some);
+    return read_metadata_file(&cached).map(Some);
 }
 
-fn parsed(file: &Path) -> Result<MavenMetadata, String> {
+fn read_metadata_file(file: &Path) -> Result<MavenMetadata, String> {
     return MavenMetadata::parse(&system::read_file(file)?)
         .map_err(|error| format!("{} is not valid Maven metadata: {error}", file.display()));
 }

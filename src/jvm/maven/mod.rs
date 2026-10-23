@@ -80,7 +80,8 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
         (
             "maven_local",
             builtin("maven_local", repository(), |_, _| {
-                Ok(format!("file://{}", local_repository().display()).into())
+                let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+                Ok(format!("file://{}", home.join(".m2/repository").display()).into())
             }),
         ),
         (
@@ -314,10 +315,8 @@ impl MavenCoordinate {
         );
     }
 
-    /// Of a file a variant names in the .module file. Its url is relative to
-    /// the .module file, Guava points its Android variant at another version:
-    /// "../33.6.0-android/guava-33.6.0-android.jar". None for urls that leave
-    /// the directory of the artifact.
+    /// Of a file a variant names in the .module file, relative to it: Guava points its Android
+    /// variant at another version. None for urls that leave the directory of the artifact.
     fn variant_file_path(&self, url: &str) -> Option<String> {
         let mut segments = vec![self.version.as_str()];
 
@@ -345,9 +344,8 @@ impl MavenCoordinate {
 }
 
 impl MavenRepository {
-    /// http(s) URLs are remote repositories, anything else is a directory
-    /// (optionally prefixed with file://), relative to the project. Remote ones
-    /// may be followed by credentials(USERNAME_ENV, PASSWORD_ENV).
+    /// http(s) URLs are remote, maybe followed by credentials(USERNAME_ENV, PASSWORD_ENV),
+    /// anything else is a directory relative to the project, optionally with file://
     pub fn parse(spec: &str, project_dir: &Path) -> Result<Self, String> {
         let (location, credentials) = match spec.split_once(" credentials(") {
             Some((location, names)) => (location, Some(RepositoryCredentials::parse(names)?)),
@@ -446,9 +444,8 @@ impl TargetPlatform {
         }
     }
 
-    /// How well a variant's `org.gradle.jvm.environment` fits, best first, None
-    /// if it does not run here. AndroidX marks its Android variants with it
-    /// instead of the androidJvm platform type.
+    /// How well a variant's `org.gradle.jvm.environment` fits, best first, None if it does
+    /// not run here. AndroidX marks Android variants with it instead of androidJvm.
     fn jvm_environment_rank(&self, environment: Option<&str>) -> Option<usize> {
         match (self, environment) {
             (TargetPlatform::Jvm, Some("android")) => return None,
@@ -520,10 +517,6 @@ fn concrete_version(version: &str) -> Result<String, String> {
     }
 
     return Ok(lower.to_string());
-}
-
-fn local_repository() -> PathBuf {
-    return system::user_home_dir().join(".m2").join("repository");
 }
 
 #[derive(Debug)]

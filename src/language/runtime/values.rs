@@ -63,11 +63,10 @@ pub struct BuiltModule {
     pub tests: Vec<TestSuite>,
 }
 
-/// A module whose build may still run on a thread of its own. Whatever needs what
-/// it built waits for it, so modules that do not depend on each other build in parallel.
+/// A module that may still be building on its own thread, whatever needs it waits for it
 #[derive(Debug)]
 pub struct PendingModule {
-    /// the function that builds it and where the script calls it, for its error
+    /// what builds it and where the script calls it, for its error
     pub function: &'static str,
     pub span: Span,
     result: Mutex<Option<Result<Arc<BuiltModule>, BuildFailure>>>,
@@ -89,12 +88,11 @@ pub struct TestSuite {
     pub tests: ModuleTests,
 }
 
-/// The tests of a module `build-script test` selected. They run once the whole
-/// script is built, unless their outcome is clear before.
+/// The tests `build-script test` selected, run once the whole script is built
 #[derive(Debug)]
 pub enum ModuleTests {
     Run(Box<dyn TestRunner>),
-    /// without running anything: no tests, up to date, not compiled
+    /// clear without running them: no tests, up to date, not compiled
     Known(TestOutcome),
 }
 
@@ -110,17 +108,18 @@ pub struct TestRun {
     /// for the log: JUnit Platform 1.14.4
     pub runner: String,
     program: OsString,
-    args: Vec<OsString>,
-    envs: Vec<(OsString, Option<OsString>)>,
+    arguments: Vec<OsString>,
+    /// None removes the variable
+    environment: Vec<(OsString, Option<OsString>)>,
     directory: Option<PathBuf>,
-    /// emptied before the run, the JUnit XML reports the run writes there count
+    /// emptied before the run, so only the JUnit XML reports of this run count
     reports_dir: PathBuf,
     /// stored once the tests passed, they do not run again until their inputs change
     fingerprint: InputFingerprint,
 }
 
 /// What `build-script test` found for a module. A failure is an outcome, not an
-/// error: the other modules still build and run their tests.
+/// error: the other modules still run their tests.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TestOutcome {
     NoTests,
@@ -143,8 +142,7 @@ pub struct TestCounts {
     pub skipped: u32,
 }
 
-/// What modules of a language category keep for the modules depending on them
-/// and for `build-script run`
+/// What a language category keeps of a module for the modules depending on it and for `build-script run`
 #[derive(Debug)]
 pub enum ModuleOutput {
     Jvm(JvmOutput),
@@ -278,8 +276,8 @@ impl TestRun {
         return TestRun {
             runner,
             program: command.get_program().to_os_string(),
-            args: command.get_args().map(OsStr::to_os_string).collect(),
-            envs: command
+            arguments: command.get_args().map(OsStr::to_os_string).collect(),
+            environment: command
                 .get_envs()
                 .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
                 .collect(),
@@ -302,9 +300,9 @@ impl TestRunner for TestRun {
         }
 
         let mut command = Command::new(&self.program);
-        command.args(&self.args);
+        command.args(&self.arguments);
 
-        for (key, value) in &self.envs {
+        for (key, value) in &self.environment {
             match value {
                 Some(value) => command.env(key, value),
                 None => command.env_remove(key),
@@ -315,7 +313,7 @@ impl TestRunner for TestRun {
             command.current_dir(directory);
         }
 
-        let result = system::run(&mut command, "tests");
+        let result = system::run_command(&mut command, "tests");
         let counts = TestCounts::read_junit_reports(&self.reports_dir);
 
         if let Err(error) = result {
@@ -439,9 +437,8 @@ impl Hash for Value {
     }
 }
 
-/// Structural equality. Function types are equal when their parameters have the
-/// same types and are required in the same places, names and default values
-/// do not matter.
+/// Structural. Function types are equal with the same parameter types, required in the
+/// same places; names and default values do not matter.
 impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {

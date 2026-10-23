@@ -17,16 +17,15 @@ use super::module::{Dependencies, ModuleBuildInputs};
 
 pub const DEFAULT_KSP_VERSION: &str = "2.3.12";
 const KSP_MAIN_CLASS: &str = "com.google.devtools.ksp.cmdline.KSPJvmMain";
-/// KSP splits its lists and its option map at File.pathSeparatorChar. Its JVM
-/// gets one that occurs neither in paths nor in option values, so values may
-/// contain ':' (URLs, Windows paths).
+/// KSP splits its lists at File.pathSeparatorChar. Its JVM gets one that is in no
+/// path and no option value, so values may contain ':' like URLs.
 const KSP_LIST_SEPARATOR: char = '\u{1F}';
 /// in the caches directory: what the last run saw
 const SNAPSHOT_FILE_NAME: &str = "build-script-snapshot";
 /// in the caches directory: KSP's map of sources to their outputs
 const SOURCE_TO_OUTPUTS_FILE_NAME: &str = "sourceToOutputs";
-/// the entry of sourceToOutputs that lists outputs of incremental runs which
-/// became invalid. KSP leaves deleting them to its caller, like its Gradle plugin.
+/// The entry of sourceToOutputs with outputs of incremental runs that became
+/// invalid, KSP leaves deleting them to its caller
 const REMOVED_OUTPUTS_KEY: &str = "<This is a virtual key for removed outputs; DO NOT USE>";
 
 /// The symbol processors of a module, like ksp(...) dependencies in Gradle
@@ -73,7 +72,6 @@ pub struct SymbolProcessorOutput {
 }
 
 impl SymbolProcessors {
-    /// The processors of the list argument `name`, with ksp_options and ksp_version
     /// Of modules without Kotlin
     pub fn none() -> Self {
         return SymbolProcessors {
@@ -83,6 +81,7 @@ impl SymbolProcessors {
         };
     }
 
+    /// The processors of the list argument `name`, with ksp_options and ksp_version
     pub fn read(args: &Arguments, name: &str, kotlin_version: &str) -> Result<Self, String> {
         return Ok(SymbolProcessors {
             processors: Dependencies::read(args, name, kotlin_version)?,
@@ -129,10 +128,8 @@ impl SymbolProcessors {
 }
 
 impl SymbolProcessing<'_> {
-    /// Runs the processors, the generated Kotlin and Java go to kotlinc and
-    /// javac afterwards. Like with Gradle, KSP runs incrementally: after a run
-    /// with the same processors, options and classpath it only gets the sources
-    /// that changed, and it does not run at all when none did.
+    /// Runs the processors, kotlinc and javac compile what they generate. Incremental
+    /// like with Gradle: only changed sources, no run when none changed.
     pub fn run(&self) -> Result<SymbolProcessorOutput, String> {
         let output = SymbolProcessorOutput {
             kotlin: self.output_dir.join("kotlin"),
@@ -160,24 +157,33 @@ impl SymbolProcessing<'_> {
 
         match changes {
             Some(changes) if changes.is_empty() => {
-                self.inputs.log("Symbol processors up to date");
+                system::log(&self.inputs.name, "Symbol processors up to date");
                 self.delete_removed_outputs()?;
 
                 return Ok(output);
             }
             Some(changes) => {
-                self.inputs.log(&format!("Running symbol processors on {} changed file(s) (KSP, Kotlin {language_version})", changes.modified.len() + changes.removed.len()));
+                system::log(
+                    &self.inputs.name,
+                    &format!(
+                        "Running symbol processors on {} changed file(s) (KSP, Kotlin {language_version})",
+                        changes.modified.len() + changes.removed.len(),
+                    ),
+                );
                 if self.execute(&language_version, Some(&changes)).is_err() {
                     // the caches may not fit any more, a complete run sorts that out
-                    self.inputs
-                        .log("Incremental run failed, running all sources again");
+                    system::log(
+                        &self.inputs.name,
+                        "Incremental run failed, running all sources again",
+                    );
                     self.execute_from_scratch(&language_version)?;
                 }
             }
             None => {
-                self.inputs.log(&format!(
-                    "Running symbol processors (KSP, Kotlin {language_version})"
-                ));
+                system::log(
+                    &self.inputs.name,
+                    &format!("Running symbol processors (KSP, Kotlin {language_version})"),
+                );
                 self.execute_from_scratch(&language_version)?;
             }
         }
@@ -244,12 +250,12 @@ impl SymbolProcessing<'_> {
             .cloned()
             .collect();
 
-        let mut command = Command::new(self.inputs.jdk.tool("java"));
+        let mut command = Command::new(self.inputs.jdk.tool_path("java"));
         command
             // the JVM splits its own classpath at the separator as well
             .arg(format!("-Dpath.separator={KSP_LIST_SEPARATOR}"))
             .arg("-cp")
-            .arg(join_paths(&self.resolved.tool))
+            .arg(join_ksp_list(&self.resolved.tool))
             .arg(KSP_MAIN_CLASS)
             .arg(format!("-jvm-target={}", self.jvm_target))
             .arg(format!("-module-name={}", self.module_name))
@@ -308,11 +314,11 @@ impl SymbolProcessing<'_> {
         }
 
         // the processor classpath comes last
-        command.arg(join_paths(&self.resolved.processors));
+        command.arg(join_ksp_list(&self.resolved.processors));
         // relative paths in options, like room.schemaLocation, belong to the module
         command.current_dir(&self.inputs.directory);
 
-        return system::run(&mut command, "KSP");
+        return system::run_command(&mut command, "KSP");
     }
 
     /// What makes earlier output invalid when it changes: processors, options,
@@ -471,13 +477,13 @@ fn path_option(name: &str, path: &Path) -> OsString {
 
 fn list_option(name: &str, paths: &[PathBuf]) -> OsString {
     let mut option = OsString::from(format!("{name}="));
-    option.push(join_paths(paths));
+    option.push(join_ksp_list(paths));
 
     return option;
 }
 
-/// Paths for KSP's lists, joined with its separator
-fn join_paths(paths: &[PathBuf]) -> OsString {
+/// Paths joined with KSP's list separator
+fn join_ksp_list(paths: &[PathBuf]) -> OsString {
     let mut joined = OsString::new();
 
     for (index, path) in paths.iter().enumerate() {
@@ -534,7 +540,7 @@ mod tests {
 
     #[test]
     fn lists_for_ksp_keep_colons_in_values() {
-        let joined = join_paths(&[PathBuf::from("/a"), PathBuf::from("C:/b")]);
+        let joined = join_ksp_list(&[PathBuf::from("/a"), PathBuf::from("C:/b")]);
         assert_eq!(
             joined,
             OsString::from(format!("/a{KSP_LIST_SEPARATOR}C:/b"))

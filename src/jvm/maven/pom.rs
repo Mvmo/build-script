@@ -11,16 +11,16 @@ use super::{MAX_DEPTH, MavenCoordinate};
 #[serde(rename_all = "camelCase", default)]
 pub struct PomFile {
     pub parent: Option<PomParent>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     pub packaging: Option<String>,
     pub properties: HashMap<String, String>,
     dependencies: PomDependencyList,
     dependency_management: PomDependencyManagement,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     pub name: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     pub description: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     pub url: Option<String>,
     developers: PomDevelopers,
     licenses: PomLicenses,
@@ -29,11 +29,11 @@ pub struct PomFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PomParent {
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     pub group_id: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     pub artifact_id: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     pub version: Option<String>,
 }
 
@@ -298,19 +298,19 @@ struct PomDependencyList {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct PomDependencyEntry {
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     group_id: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     artifact_id: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     version: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     classifier: Option<String>,
-    #[serde(rename = "type", deserialize_with = "text")]
+    #[serde(rename = "type", deserialize_with = "trimmed_text")]
     artifact_type: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     scope: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     optional: Option<String>,
     exclusions: PomExclusionList,
 }
@@ -324,9 +324,9 @@ struct PomExclusionList {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct PomExclusionEntry {
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     group_id: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     artifact_id: Option<String>,
 }
 
@@ -339,9 +339,9 @@ struct PomDevelopers {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct PomDeveloper {
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     id: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     name: Option<String>,
 }
 
@@ -354,14 +354,14 @@ struct PomLicenses {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct PomLicense {
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     name: Option<String>,
-    #[serde(deserialize_with = "text")]
+    #[serde(deserialize_with = "trimmed_text")]
     url: Option<String>,
 }
 
-/// Trimmed, empty elements count as missing
-fn text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+/// Trimmed, None for an empty element
+fn trimmed_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
     let text = Option::<String>::deserialize(deserializer)?;
     return Ok(text
         .map(|text| text.trim().to_string())

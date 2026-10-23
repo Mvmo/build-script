@@ -414,13 +414,13 @@ impl RemotePackage {
 
     /// For this operating system and architecture
     pub fn archive(&self) -> Option<&Archive> {
-        let os = match system::host_os().ok()? {
+        let os = match system::host_operating_system().ok()? {
             HostOperatingSystem::MacOs => "macosx",
             HostOperatingSystem::Linux => "linux",
             HostOperatingSystem::Windows => "windows",
         };
 
-        let arch = match system::host_arch().ok()? {
+        let arch = match system::host_architecture().ok()? {
             HostArchitecture::Aarch64 => "aarch64",
             HostArchitecture::X86_64 => "x64",
         };

@@ -76,10 +76,8 @@ impl JavaResources {
         return inputs;
     }
 
-    /// Puts the resources together in `output`, like Gradle does in build/resources/main:
-    /// the directories, `generated_dirs` (resources of symbol processors), the files and
-    /// the texts, with the tokens replaced. Two resources for one path are an error, like
-    /// in Gradle since 7.
+    /// The resources in `output` like build/resources/main of Gradle, tokens replaced.
+    /// Two resources for one path are an error, like in Gradle 7.
     pub fn process(&self, generated_dirs: &[PathBuf], output: &Path) -> Result<(), String> {
         let mut resources: BTreeMap<PathBuf, Resource> = BTreeMap::new();
 

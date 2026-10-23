@@ -70,8 +70,7 @@ pub fn launch(module: &BuiltModule, output: &JvmOutput, args: &[String]) -> Resu
     match &output.launch {
         None => {
             return Err(format!(
-                "{} cannot be run,
-                only modules with a main_class and Android apps can",
+                "{} cannot be run, only modules with a main_class and Android apps can",
                 module.name
             ));
         }

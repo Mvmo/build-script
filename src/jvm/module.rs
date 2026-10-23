@@ -129,9 +129,8 @@ pub struct KotlinCompilerPlugin {
     pub options: Vec<String>,
 }
 
-/// One compilation of the Kotlin and Java sources of a module or of its tests:
-/// the symbol processors, kotlinc (which reads the Java sources too), then
-/// javac with the annotation processors
+/// One compilation of a module or its tests: symbol processors, kotlinc (which reads
+/// the Java sources too), then javac with the annotation processors
 pub struct Compilation<'a> {
     pub inputs: &'a ModuleBuildInputs,
     /// the compiler and its plugins
@@ -174,21 +173,20 @@ pub fn source_set_dirs(source_sets: &[&str], kinds: &[&str]) -> Value {
     return Value::List(dirs.into_iter().map(Value::String).collect());
 }
 
-/// The parameters of the module functions that ModuleBuildInputs reads, those
-/// of Kotlin only with its sources. Sources and resources come from
-/// `source_sets`, later ones lie over earlier ones.
-pub fn module_params(
-    params: FunctionParameters,
+/// The parameters ModuleBuildInputs reads, Kotlin's only for Kotlin sources. Sources
+/// and resources come from `source_sets`, later ones lie over earlier ones.
+pub fn module_parameters(
+    parameters: FunctionParameters,
     source_sets: &[&str],
     sources: Sources,
 ) -> FunctionParameters {
     let strings = || Type::list(Type::String);
     let none = || Value::string_list(&[]);
     let kotlin = sources == Sources::KotlinAndJava;
-    let mut params = params.with_default("compile_only", dependencies_type(), none());
+    let mut parameters = parameters.with_default("compile_only", dependencies_type(), none());
 
     if kotlin {
-        params = params
+        parameters = parameters
             // short names like "compose" or Maven coordinates of compiler plugins
             .with_default("plugins", strings(), none())
             // passed to the plugins as -P, like plugin:org.jetbrains.kotlin.allopen:annotation=com.example.Open
@@ -197,10 +195,10 @@ pub fn module_params(
     }
 
     // like annotationProcessor in Gradle: javac processors for the Java sources
-    params = params.with_default("annotation_processors", dependencies_type(), none());
+    parameters = parameters.with_default("annotation_processors", dependencies_type(), none());
 
     if kotlin {
-        params = params
+        parameters = parameters
             // like ksp in Gradle: Kotlin symbol processors, run before kotlinc
             .with_default("ksp", dependencies_type(), none())
             // "key=value" for the symbol processors
@@ -209,7 +207,7 @@ pub fn module_params(
             .with_default("kotlin_version", Type::String, DEFAULT_KOTLIN_VERSION);
     }
 
-    return params
+    return parameters
         .with_default("jdk", Type::String, jdk::DEFAULT_JAVA_VERSION)
         .with_default("directory", Type::String, ".")
         .with_default(
@@ -270,9 +268,8 @@ pub fn kotlin_and_java_sources(directories: &[PathBuf]) -> (Vec<PathBuf>, Vec<Pa
         .partition(|file| extension_is(file, "kt"));
 }
 
-/// javac into `output`, Kotlin classes already there are on the classpath.
-/// Only the given annotation processors run, none that libraries on the
-/// classpath bring along.
+/// javac into `output`, the Kotlin classes there on the classpath. Only the given
+/// annotation processors run, none that libraries bring along.
 pub fn compile_java(
     jdk: &Jdk,
     sources: &[PathBuf],
@@ -285,7 +282,7 @@ pub fn compile_java(
     let mut java_classpath = vec![output.to_path_buf()];
     java_classpath.extend(classpath.iter().cloned());
 
-    let mut command = Command::new(jdk.tool("javac"));
+    let mut command = Command::new(jdk.tool_path("javac"));
     command
         .arg("-d")
         .arg(output)
@@ -316,7 +313,7 @@ pub fn compile_java(
 
     command.args(sources);
 
-    return system::run(&mut command, "javac");
+    return system::run_command(&mut command, "javac");
 }
 
 /// Everything in `directories`, with `manifest` or without one
@@ -328,7 +325,7 @@ pub fn create_jar(
 ) -> Result<(), String> {
     system::create_parent_dir(jar_file)?;
 
-    let mut command = Command::new(jdk.tool("jar"));
+    let mut command = Command::new(jdk.tool_path("jar"));
 
     match manifest {
         Some(manifest) => command.arg("cfm").arg(jar_file).arg(manifest),
@@ -339,7 +336,7 @@ pub fn create_jar(
         command.arg("-C").arg(directory).arg(".");
     }
 
-    return system::run(&mut command, &format!("creating {}", jar_file.display()));
+    return system::run_command(&mut command, &format!("creating {}", jar_file.display()));
 }
 
 impl ModuleBuildInputs {
@@ -424,14 +421,8 @@ impl ModuleBuildInputs {
         });
     }
 
-    pub fn log(&self, message: &str) {
-        system::log(&self.name, message);
-    }
-
-    /// The compiler, its plugins, the processors, and the libraries: Maven
-    /// artifacts of this module and of all modules it depends on in one
-    /// resolution, so their versions agree, plus the matching kotlin-stdlib
-    /// like the Gradle plugin adds it
+    /// Compiler, plugins, processors and libraries: the Maven artifacts of this module and
+    /// the modules below in one resolution so versions agree, plus kotlin-stdlib like Gradle
     pub fn resolve(&self, platform: TargetPlatform) -> Result<ResolvedDependencies, String> {
         let mut resolver = DependencyResolver::new(self.repositories.clone(), platform);
         // the compiler, its plugins and the processors run in the build, on the
@@ -440,10 +431,10 @@ impl ModuleBuildInputs {
 
         let (compiler_modules, compiler) = match self.sources {
             Sources::KotlinAndJava => {
-                self.log(&format!(
-                    "Resolving dependencies (Kotlin {})",
-                    self.kotlin_version
-                ));
+                system::log(
+                    &self.name,
+                    &format!("Resolving dependencies (Kotlin {})", self.kotlin_version),
+                );
                 let compiler = MavenCoordinate::new(
                     "org.jetbrains.kotlin",
                     "kotlin-compiler-embeddable",
@@ -456,7 +447,7 @@ impl ModuleBuildInputs {
             }
             // javac comes with the JDK
             Sources::Java => {
-                self.log("Resolving dependencies");
+                system::log(&self.name, "Resolving dependencies");
                 (vec![], vec![])
             }
         };
@@ -551,17 +542,13 @@ impl ModuleBuildInputs {
         let mut resolver = DependencyResolver::new(self.repositories.clone(), platform);
         let (roots, platforms) = self.runtime_dependencies();
         let libraries = resolver.license_entries(&roots, &platforms)?;
-        self.log(&format!("License report of {} libraries", libraries.len()));
+        system::log(&self.name, &format!("License report of {} libraries", libraries.len()));
 
         return Ok(maven::license_report(&libraries).to_string());
     }
 
-    /// What the outputs of the module depend on: the arguments of the build
-    /// function, the JDK, the sources, `extra_inputs` like resources and what
-    /// the modules among the arguments and all modules below them produced,
-    /// processors included. Maven dependencies count through the arguments,
-    /// their files never change, except for the newest build of a SNAPSHOT.
-    /// Kept in build/fingerprints/`name`.
+    /// What the outputs depend on: arguments, JDK, sources, `extra_inputs` like resources,
+    /// the modules below and the newest SNAPSHOT builds. Kept in build/fingerprints/`name`.
     pub fn input_fingerprint(
         &self,
         name: &str,
@@ -615,7 +602,7 @@ impl ModuleBuildInputs {
         let up_to_date = fingerprint.is_up_to_date(outputs)?;
 
         if up_to_date {
-            self.log("Up to date");
+            system::log(&self.name, "Up to date");
         }
 
         return Ok(up_to_date);
@@ -624,7 +611,7 @@ impl ModuleBuildInputs {
     /// Remembers the fingerprint of the successful build and names what it produced
     pub fn finish(&self, fingerprint: &InputFingerprint, artifact: &Path) -> Result<(), String> {
         fingerprint.store()?;
-        self.log(&format!("Done: {}", artifact.display()));
+        system::log(&self.name, &format!("Done: {}", artifact.display()));
 
         return Ok(());
     }
@@ -664,6 +651,7 @@ impl Dependencies {
             match value {
                 Value::String(notation) => match DependencyNotation::parse(&notation)? {
                     DependencyNotation::Library(coordinate) => {
+                        let coordinate = with_kotlin_version(coordinate, kotlin_version);
                         dependencies.libraries.push(coordinate)
                     }
                     DependencyNotation::Platform(coordinate) => {
@@ -684,8 +672,6 @@ impl Dependencies {
                 }
             }
         }
-
-        dependencies.libraries = fill_in_kotlin_version(dependencies.libraries, kotlin_version);
 
         return Ok(dependencies);
     }
@@ -734,8 +720,8 @@ impl KotlinCompilerPlugin {
     /// org.jetbrains.kotlin may leave out the version, they get the compiler's.
     pub fn find(name_or_coordinate: &str, kotlin_version: &str) -> Result<Self, String> {
         if name_or_coordinate.contains(':') {
-            let coordinate = MavenCoordinate::parse(name_or_coordinate)?;
-            let coordinate = fill_in_kotlin_version(vec![coordinate], kotlin_version).remove(0);
+            let coordinate =
+                with_kotlin_version(MavenCoordinate::parse(name_or_coordinate)?, kotlin_version);
 
             if coordinate.version.is_empty() {
                 return Err(format!(
@@ -835,15 +821,15 @@ impl Compilation<'_> {
         system::recreate_dir(self.output)?;
         let files = if tests { "test file(s)" } else { "file(s)" };
         if !kotlin_sources.is_empty() {
-            self.inputs.log(&format!(
-                "Compiling {} Kotlin {files}",
-                kotlin_sources.len()
-            ));
+            system::log(
+                &self.inputs.name,
+                &format!("Compiling {} Kotlin {files}", kotlin_sources.len()),
+            );
 
             let mut command = self
                 .inputs
                 .jdk
-                .java_main(&self.tools.compiler, KOTLIN_COMPILER_MAIN_CLASS)?;
+                .java_command(&self.tools.compiler, KOTLIN_COMPILER_MAIN_CLASS)?;
 
             command
                 // the standard library is already on the classpath
@@ -877,12 +863,14 @@ impl Compilation<'_> {
                 .args(&self.inputs.kotlin_args)
                 .args(&kotlin_sources)
                 .args(&java_sources);
-            system::run(&mut command, "compilation")?;
+            system::run_command(&mut command, "compilation")?;
         }
 
         if !java_sources.is_empty() {
-            self.inputs
-                .log(&format!("Compiling {} Java {files}", java_sources.len()));
+            system::log(
+                &self.inputs.name,
+                &format!("Compiling {} Java {files}", java_sources.len()),
+            );
 
             let generated_dir = build_dir
                 .join("generated/sources/annotationProcessor/java")
@@ -907,22 +895,16 @@ impl Compilation<'_> {
     }
 }
 
-fn fill_in_kotlin_version(
-    coordinates: Vec<MavenCoordinate>,
-    kotlin_version: &str,
-) -> Vec<MavenCoordinate> {
-    return coordinates
-        .into_iter()
-        .map(|coordinate| {
-            if coordinate.group == "org.jetbrains.kotlin" && coordinate.version.is_empty() {
-                return MavenCoordinate {
-                    version: kotlin_version.to_string(),
-                    ..coordinate
-                };
-            }
-            return coordinate;
-        })
-        .collect();
+/// Kotlin's own libraries without a version get the compiler's
+fn with_kotlin_version(coordinate: MavenCoordinate, kotlin_version: &str) -> MavenCoordinate {
+    if coordinate.group == "org.jetbrains.kotlin" && coordinate.version.is_empty() {
+        return MavenCoordinate {
+            version: kotlin_version.to_string(),
+            ..coordinate
+        };
+    }
+
+    return coordinate;
 }
 
 #[cfg(test)]

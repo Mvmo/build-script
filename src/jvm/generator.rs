@@ -40,8 +40,9 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
     )];
 }
 
-/// Runs a tool that writes sources into build/generated/sources/<name> of the directory and returns that directory, for generated_sources of a module.
-/// The tool runs in the directory, inputs and args are relative to it, tool_sources to the build script.
+/// Runs a tool that writes sources into build/generated/sources/<name>, returns that
+/// directory for generated_sources. The tool runs in `directory`, inputs and args are
+/// relative to it, tool_sources to the build script.
 fn generate_sources(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let name: String = args.get("name")?;
     let main_class: String = args.get("main_class")?;
@@ -115,7 +116,7 @@ fn generate_sources(context: &BuildScriptContext, args: &Arguments) -> Result<Va
 
     system::recreate_dir(&output)?;
     let output_arg = output.display().to_string();
-    let mut command = jdk.java_main(&classpath, &main_class)?;
+    let mut command = jdk.java_command(&classpath, &main_class)?;
     command
         .args(
             args.get::<Vec<String>>("args")?
@@ -124,7 +125,7 @@ fn generate_sources(context: &BuildScriptContext, args: &Arguments) -> Result<Va
         )
         // paths in the arguments are relative to the directory
         .current_dir(&directory);
-    system::run(&mut command, &main_class)?;
+    system::run_command(&mut command, &main_class)?;
 
     fingerprint.store()?;
     system::log(&name, &format!("Done: {output_arg}"));

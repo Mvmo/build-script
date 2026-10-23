@@ -93,9 +93,8 @@ impl DependencyResolver {
         return Ok(files);
     }
 
-    /// What the POMs of the resolved libraries say about them. Libraries
-    /// without files (BOMs) are left out, the rest is sorted by name like in
-    /// the Gradle license plugin.
+    /// What the POMs of the resolved libraries say, without BOMs, sorted by name like
+    /// the Gradle license plugin does it
     pub fn license_entries(
         &mut self,
         roots: &[MavenCoordinate],
@@ -185,9 +184,8 @@ impl DependencyResolver {
         return self.collect_reachable(roots, &selected);
     }
 
-    /// First pass: finds the highest requested version of every module.
-    /// Dependency constraints of Gradle published modules (kotlin-stdlib,
-    /// androidx) raise the versions of modules that are in the graph anyway.
+    /// First pass: the highest requested version of every module. Constraints of modules
+    /// published by Gradle (kotlin-stdlib, androidx) raise versions of modules in the graph.
     fn select_versions(
         &mut self,
         roots: &[MavenCoordinate],
@@ -391,9 +389,8 @@ impl DependencyResolver {
         return Ok(metadata);
     }
 
-    /// The root component a platform specific module was published for. Only
-    /// a real one counts: it has a url and its variants point back here (JitPack
-    /// names an aggregate there instead).
+    /// The root component a platform module belongs to, only a real one: with a url and
+    /// variants pointing back here (JitPack names an aggregate instead)
     fn root_component(
         &mut self,
         coordinate: &MavenCoordinate,
@@ -437,7 +434,7 @@ impl DependencyResolver {
             return Ok(None);
         };
 
-        let points_back = items(root_metadata.get("variants")).iter().any(|variant| {
+        let points_back = json_array(root_metadata.get("variants")).iter().any(|variant| {
             let at_this_module = variant
                 .get("available-at")
                 .and_then(|available| available.get("module"))
@@ -446,7 +443,7 @@ impl DependencyResolver {
 
             // a variant with capabilities of its own is an optional feature of the
             // root (kotlin-test-junit5 of kotlin-test), not its platform part
-            let feature = items(variant.get("capabilities")).iter().any(|capability| {
+            let feature = json_array(variant.get("capabilities")).iter().any(|capability| {
                 capability.get("name").and_then(Json::as_str) != Some(root.artifact.as_str())
             });
             at_this_module && !feature
@@ -520,7 +517,7 @@ impl DependencyResolver {
             return Some((platform, environment, debug));
         };
 
-        let variants = items(metadata.get("variants"));
+        let variants = json_array(metadata.get("variants"));
         let Some(best) = variants
             .iter()
             .filter_map(|variant| rank(variant).map(|rank| (rank, variant)))
@@ -584,7 +581,7 @@ impl DependencyResolver {
         let mut dependencies = vec![];
         let mut constraints = vec![];
 
-        for dependency in items(best.get("dependencies")) {
+        for dependency in json_array(best.get("dependencies")) {
             let Some((group, artifact)) = name_of(dependency) else {
                 continue;
             };
@@ -610,7 +607,7 @@ impl DependencyResolver {
                 continue;
             }
 
-            let exclusions = items(dependency.get("excludes"))
+            let exclusions = json_array(dependency.get("excludes"))
                 .iter()
                 .map(|exclude| PomExclusion {
                     group: exclude
@@ -637,7 +634,7 @@ impl DependencyResolver {
             ));
         }
 
-        for constraint in items(best.get("dependencyConstraints")) {
+        for constraint in json_array(best.get("dependencyConstraints")) {
             let (Some((group, artifact)), Some(version)) =
                 (name_of(constraint), version_of(constraint))
             else {
@@ -654,7 +651,7 @@ impl DependencyResolver {
             }
         }
 
-        let files = items(best.get("files"))
+        let files = json_array(best.get("files"))
             .iter()
             .filter_map(|file| file.get("url").and_then(Json::as_str).map(str::to_string))
             .collect();
@@ -1101,7 +1098,7 @@ fn managed_versions(bom: &EffectivePom) -> Vec<MavenCoordinate> {
 }
 
 /// The elements of a JSON array, none for anything else
-fn items(value: Option<&Json>) -> &[Json] {
+fn json_array(value: Option<&Json>) -> &[Json] {
     return value
         .and_then(Json::as_array)
         .map(Vec::as_slice)

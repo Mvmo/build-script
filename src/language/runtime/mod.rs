@@ -103,7 +103,7 @@ impl Runtime {
         let project_dir = std::fs::canonicalize(&project_dir).unwrap_or(project_dir);
 
         let mut runtime = Runtime {
-            scope: Scope::root(),
+            scope: Arc::new(Mutex::new(Scope::default())),
             context: BuildScriptContext {
                 project_dir,
                 tests: TestSelection::None,
@@ -140,10 +140,9 @@ impl Runtime {
         return Ok(());
     }
 
-    /// The value of `expression` after the assignments of the script before
-    /// `before`, without building anything: of the platform functions only
-    /// `functions` are there, assignments that need others are left out. For
-    /// install, which reads the repositories of a module from the script.
+    /// The value of `expression` after the assignments before `before`, without
+    /// building: of the platform functions only `functions` are there, assignments
+    /// that need others are left out. For install, which reads a module's repositories.
     pub fn evaluate_unbuilt(
         &mut self,
         script: &Script,
@@ -174,7 +173,7 @@ impl Runtime {
     }
 
     /// Waits for the builds still running. The modules in build order, or why builds
-    /// failed: modules whose dependencies failed leave it to the error of those.
+    /// failed: a module whose dependency failed leaves the error to that one.
     pub fn finish(&self) -> Result<Vec<Arc<BuiltModule>>, Vec<RuntimeError>> {
         let mut modules = vec![];
         let mut errors = vec![];
@@ -213,20 +212,19 @@ impl Runtime {
                 return Ok(());
             }
             StatementType::Use(UseTarget::Ident(platform)) => {
-                return self.load_platform(&platform.str, statement.span);
+                return self.load_platform(&platform.name, statement.span);
             }
             StatementType::Use(UseTarget::FilePath { path, span }) => {
-                return Err(RuntimeError::unsupported(
-                    format!("use with a file path (\"{path}\")"),
-                    *span,
-                ));
+                let feature = format!("use with a file path (\"{path}\")");
+                return Err(RuntimeError::new(RuntimeErrorType::Unsupported { feature }, *span));
             }
         }
     }
 
     fn load_platform(&mut self, name: &str, span: Span) -> Result<(), RuntimeError> {
         let Some(platform) = platforms().find(|platform| platform.name == name) else {
-            return Err(RuntimeError::unknown_platform(name.to_string(), span));
+            let name = name.to_string();
+            return Err(RuntimeError::new(RuntimeErrorType::UnknownPlatform { name }, span));
         };
 
         for (function, value) in (platform.functions)() {
@@ -251,7 +249,10 @@ impl Runtime {
                     .scope
                     .lock().unwrap()
                     .get(name)
-                    .ok_or_else(|| RuntimeError::undefined_variable(name.clone(), span));
+                    .ok_or_else(|| {
+                        let name = name.clone();
+                        RuntimeError::new(RuntimeErrorType::UndefinedVariable { name }, span)
+                    });
             }
 
             ExpressionType::Assignment { target, value } => {
@@ -323,7 +324,7 @@ impl Runtime {
                 };
 
                 return match block {
-                    Some(block) => self.evaluate_block(block),
+                    Some(block) => self.evaluate_in(Scope::child(&self.scope), block),
                     None => Ok(Value::Unit),
                 };
             }
@@ -355,7 +356,11 @@ impl Runtime {
         }
     }
 
-    fn evaluate_bool(&mut self, expression: &Expression, what: &'static str) -> Result<bool, RuntimeError> {
+    fn evaluate_bool(
+        &mut self,
+        expression: &Expression,
+        what: &'static str,
+    ) -> Result<bool, RuntimeError> {
         match self.evaluate(expression)? {
             Value::Bool(bool) => return Ok(bool),
             other => {
@@ -367,9 +372,12 @@ impl Runtime {
         }
     }
 
-    /// In a scope below this one, like a function body: its value is the last expression's
-    fn evaluate_block(&mut self, block: &[Expression]) -> Result<Value, RuntimeError> {
-        let scope = Scope::child(&self.scope);
+    /// A block or a function body in its own scope, the value of its last expression
+    fn evaluate_in(
+        &mut self,
+        scope: SharedScope,
+        block: &[Expression],
+    ) -> Result<Value, RuntimeError> {
         let outer_scope = std::mem::replace(&mut self.scope, scope);
         let mut result = Ok(Value::Unit);
 
@@ -402,7 +410,13 @@ impl Runtime {
                     )
                 });
             }
-            _ => return Err(RuntimeError::invalid_unary_operand(operator, &value, span)),
+            _ => {
+                let variant = RuntimeErrorType::InvalidUnaryOperand {
+                    operator: operator.clone(),
+                    operand: value.type_of(),
+                };
+                return Err(RuntimeError::new(variant, span));
+            }
         }
     }
 
@@ -528,8 +542,7 @@ impl Runtime {
         }
     }
 
-    /// Types are resolved and defaults evaluated once, here. The body runs in a
-    /// scope below this one.
+    /// Resolves the types and evaluates the defaults once. The body runs in a scope below this one.
     fn define_function(
         &mut self,
         name: &str,
@@ -540,10 +553,10 @@ impl Runtime {
         let mut declared = FunctionParameters::new();
 
         for param in params {
-            let param_name = &param.name.str;
+            let param_name = &param.name.name;
 
             if declared
-                .params
+                .fixed
                 .iter()
                 .any(|known| known.name == *param_name)
             {
@@ -576,7 +589,7 @@ impl Runtime {
                 None => ParameterDefault::Required,
             };
 
-            declared.params.push(FunctionParameter {
+            declared.fixed.push(FunctionParameter {
                 name: param_name.clone(),
                 param_type,
                 default,
@@ -625,10 +638,10 @@ impl Runtime {
                 ));
             }
             TypeExpressionType::Function { params, returns } => {
-                let mut signature = FunctionParameters::new();
+                let mut parameters = FunctionParameters::new();
 
                 for param in params {
-                    signature.params.push(FunctionParameter {
+                    parameters.fixed.push(FunctionParameter {
                         name: String::new(),
                         param_type: Self::resolve_type(param)?,
                         default: ParameterDefault::Required,
@@ -636,7 +649,7 @@ impl Runtime {
                 }
 
                 return Ok(Type::Function(Arc::new(
-                    signature.returns(Self::resolve_type(returns)?),
+                    parameters.returns(Self::resolve_type(returns)?),
                 )));
             }
         }
@@ -655,10 +668,13 @@ impl Runtime {
                 function,
             } => (name, signature, function),
             Value::Function(function) => return self.call_function(&function, arguments, span),
-            other => return Err(RuntimeError::not_callable(&other, span)),
+            other => {
+                let value_type = other.type_of();
+                return Err(RuntimeError::new(RuntimeErrorType::NotCallable { value_type }, span));
+            }
         };
 
-        let args = bind(name, &signature.params, arguments, span)?;
+        let args = bind(name, &signature.parameters, arguments, span)?;
 
         // modules build on threads of their own, the script goes on meanwhile
         if matches!(signature.returns, Type::Module) {
@@ -726,8 +742,7 @@ impl Runtime {
         });
     }
 
-    /// The body runs in a scope below the one the function was defined in, with
-    /// the arguments as variables. The last expression is the value of the call.
+    /// The body runs in a scope below the one the function was defined in, with the arguments as variables
     fn call_function(
         &mut self,
         function: &UserFunction,
@@ -743,7 +758,7 @@ impl Runtime {
             ));
         }
 
-        let args = bind(&function.name, &function.signature.params, arguments, span)?;
+        let args = bind(&function.name, &function.signature.parameters, arguments, span)?;
         let scope = Scope::child(&function.scope);
 
         for (name, value) in args.values {
@@ -752,19 +767,9 @@ impl Runtime {
             }
         }
 
-        let caller_scope = std::mem::replace(&mut self.scope, scope);
         self.call_depth += 1;
-        let mut result = Ok(Value::Unit);
-
-        for expression in &function.body {
-            result = self.evaluate(expression);
-            if result.is_err() {
-                break;
-            }
-        }
-
+        let result = self.evaluate_in(scope, &function.body);
         self.call_depth -= 1;
-        self.scope = caller_scope;
 
         let result = result?;
 
@@ -794,10 +799,6 @@ struct Scope {
 }
 
 impl Scope {
-    fn root() -> SharedScope {
-        return Arc::new(Mutex::new(Scope::default()));
-    }
-
     fn child(parent: &SharedScope) -> SharedScope {
         return Arc::new(Mutex::new(Scope {
             variables: HashMap::new(),
@@ -821,7 +822,6 @@ fn platform_names() -> Vec<&'static str> {
     return platforms().map(|platform| platform.name).collect();
 }
 
-/// What every script has without `use`
 impl Jobs {
     fn new(count: usize) -> Self {
         return Jobs {
@@ -858,6 +858,7 @@ pub fn default_jobs() -> usize {
         .unwrap_or(1);
 }
 
+/// What every script has without `use`
 fn core_functions() -> Vec<(&'static str, Value)> {
     return vec![
         (
@@ -903,8 +904,12 @@ fn core_functions() -> Vec<(&'static str, Value)> {
                         return Ok(value.into());
                     }
 
-                    return args.get::<Option<String>>("default")?.map(Value::from).ok_or_else(|| {
-                        format!("the environment variable {name} is not set, a default = ... would be taken then")
+                    let default: Option<String> = args.get("default")?;
+
+                    return default.map(Value::from).ok_or_else(|| {
+                        format!(
+                            "the environment variable {name} is not set, a default = ... would be taken then"
+                        )
                     });
                 },
             ),
@@ -916,7 +921,10 @@ fn core_functions() -> Vec<(&'static str, Value)> {
                 FunctionParameters::new()
                     .required("name", Type::String)
                     .returns(Type::Bool),
-                |_, args| Ok(Value::Bool(std::env::var_os(args.get::<String>("name")?).is_some())),
+                |_, args| {
+                    let name: String = args.get("name")?;
+                    Ok(Value::Bool(std::env::var_os(name).is_some()))
+                },
             ),
         ),
         (

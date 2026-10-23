@@ -17,11 +17,8 @@ pub fn with_module(
     template: &ModuleTemplate,
 ) -> Result<String, String> {
     let script = Parser::new(source).parse_script().map_err(|error| {
-        format!(
-            "line {}: {}",
-            line_of(source, error.span.start),
-            error.variant
-        )
+        let line = source[..error.span.start.min(source.len())].matches('\n').count() + 1;
+        format!("line {line}: {}", error.variant)
     })?;
 
     let mut uses: Vec<(&str, usize)> = vec![];
@@ -33,7 +30,7 @@ pub fn with_module(
     for statement in &script.statements {
         let expression = match &statement.variant {
             StatementType::Use(UseTarget::Ident(platform)) => {
-                uses.push((platform.str.as_str(), statement.span.end));
+                uses.push((platform.name.as_str(), statement.span.end));
                 continue;
             }
             StatementType::Use(_) => continue,
@@ -99,7 +96,9 @@ pub fn with_module(
                         .filter(|repository| {
                             !arguments
                                 .iter()
-                                .any(|argument| calls(argument, repository.trim_end_matches("()")))
+                                .any(|argument| {
+                                    calls_function(argument, repository.trim_end_matches("()"))
+                                })
                         })
                         .copied()
                         .collect();
@@ -187,7 +186,7 @@ pub fn with_module(
         None => edits.push((source.len(), format!("\n\n{call}\n"))),
     }
 
-    return Ok(apply(source, edits));
+    return Ok(apply_edits(source, edits));
 }
 
 /// `variable = function(positional..., repositories, named = value..., directory = "...")`
@@ -260,7 +259,7 @@ pub fn module_calls(script: &Script) -> Vec<ModuleCall<'_>> {
     for statement in &script.statements {
         let expression = match &statement.variant {
             StatementType::Use(UseTarget::Ident(name)) => {
-                let platform = runtime::platforms().find(|platform| platform.name == name.str);
+                let platform = runtime::platforms().find(|platform| platform.name == name.name);
 
                 if let Some(platform) = platform {
                     for (function, value) in (platform.functions)() {
@@ -299,7 +298,7 @@ pub fn module_calls(script: &Script) -> Vec<ModuleCall<'_>> {
                 ExpressionType::Assignment { target, value } => {
                     Some((identifier(target)?.to_string(), value.as_ref()))
                 }
-                _ => Some((signature.params.params.get(index)?.name.clone(), argument)),
+                _ => Some((signature.parameters.fixed.get(index)?.name.clone(), argument)),
             })
             .collect();
 
@@ -332,7 +331,7 @@ impl ModuleCall<'_> {
     }
 
     pub fn has_parameter(&self, parameter: &str) -> bool {
-        return self.signature.params.params.iter().any(|param| param.name == parameter);
+        return self.signature.parameters.fixed.iter().any(|param| param.name == parameter);
     }
 
     /// The variable the argument names, if it does
@@ -341,9 +340,8 @@ impl ModuleCall<'_> {
     }
 }
 
-/// The script with `notation` (group:artifact:version) in the list `parameter`
-/// of the module. A list a variable holds is changed where the variable is
-/// assigned, a missing argument is added to the call.
+/// The script with `notation` in the list `parameter` of the module: a variable's list
+/// where it is assigned, a missing argument added to the call
 pub fn with_dependency(
     source: &str,
     script: &Script,
@@ -359,10 +357,10 @@ pub fn with_dependency(
         };
 
         let argument = format!("{parameter} = list({quoted})");
-        let edits = appended(source, target, module.call, args, &argument);
+        let edits = appended_argument(source, target, module.call, args, &argument);
 
         return Ok(DependencyEdit {
-            script: apply(source, edits),
+            script: apply_edits(source, edits),
             change: DependencyChange::Added,
             variable: None,
         });
@@ -371,7 +369,7 @@ pub fn with_dependency(
     let variable = identifier(argument);
 
     let list = match variable {
-        Some(variable) => assigned(script, variable, module.statement_start).ok_or_else(|| {
+        Some(variable) => last_assignment(script, variable, module.statement_start).ok_or_else(|| {
             format!(
                 "{} names {variable} as its {parameter}, which is assigned nowhere before",
                 module.name
@@ -407,7 +405,7 @@ pub fn with_dependency(
             (script, DependencyChange::Replaced(present.clone()))
         }
         None => (
-            apply(source, appended(source, target, list, args, &quoted)),
+            apply_edits(source, appended_argument(source, target, list, args, &quoted)),
             DependencyChange::Added,
         ),
     };
@@ -433,7 +431,11 @@ fn library_of(notation: &str) -> Option<(&str, &str)> {
 }
 
 /// The value of the last top level assignment to `variable` before `before`
-fn assigned<'a>(script: &'a Script, variable: &str, before: usize) -> Option<&'a Expression> {
+fn last_assignment<'a>(
+    script: &'a Script,
+    variable: &str,
+    before: usize,
+) -> Option<&'a Expression> {
     return script
         .statements
         .iter()
@@ -450,7 +452,7 @@ fn assigned<'a>(script: &'a Script, variable: &str, before: usize) -> Option<&'a
 
 /// `text` as the last argument of a call, in its style: on a line of its own
 /// when the arguments are, with a comma after it when the last one has one
-fn appended(
+fn appended_argument(
     source: &str,
     target: &Expression,
     call: &Expression,
@@ -501,7 +503,7 @@ fn appended(
     };
 }
 
-fn apply(source: &str, mut edits: Vec<(usize, String)>) -> String {
+fn apply_edits(source: &str, mut edits: Vec<(usize, String)>) -> String {
     let mut result = source.to_string();
 
     // from the end, so earlier offsets stay valid; at one offset the last added goes in first
@@ -531,7 +533,7 @@ fn list_arguments<'a>(source: &str, value: &'a Expression) -> Option<(usize, &'a
 }
 
 /// Whether the expression calls the function `name`
-fn calls(expression: &Expression, name: &str) -> bool {
+fn calls_function(expression: &Expression, name: &str) -> bool {
     let ExpressionType::FunctionCall { target, .. } = &expression.variant else {
         return false;
     };
@@ -571,10 +573,6 @@ fn start_of_line_with_comments(source: &str, offset: usize) -> usize {
         start = previous;
     }
     return start;
-}
-
-fn line_of(source: &str, offset: usize) -> usize {
-    return source.get(..offset).unwrap_or(source).matches('\n').count() + 1;
 }
 
 #[cfg(test)]
