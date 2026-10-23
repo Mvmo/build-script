@@ -49,7 +49,9 @@ fn jar_parameters(sources: Sources) -> FunctionSignature {
                 .required("repositories", Type::list(Type::String))
                 .optional("main_class", Type::String)
                 // one jar with the libraries inside, like the shadow plugin of Gradle
-                .with_default("fat_jar", Type::Bool, false),
+                .with_default("fat_jar", Type::Bool, false)
+                // "from=to": packages of the libraries moved inside the fat jar
+                .with_default("relocate", Type::list(Type::String), Value::string_list(&[])),
             &["main"],
             sources,
         ),
@@ -126,6 +128,21 @@ fn build_jar(
     let jar = libs_dir.join(format!("{}.jar", inputs.name));
 
     let fat_jar = args.get::<bool>("fat_jar")?;
+
+    let mut relocations = vec![];
+    for (from, to) in args.assignments("relocate")? {
+        let to = to.trim().to_string();
+
+        if from.is_empty() || to.is_empty() {
+            return Err(format!("relocate: '{from}={to}' needs a package on both sides"));
+        }
+
+        relocations.push((from, to));
+    }
+
+    if !relocations.is_empty() && !fat_jar {
+        return Err("relocate moves packages inside a fat jar, it needs fat_jar = true".to_string());
+    }
 
     let artifact = match fat_jar {
         true => libs_dir.join(format!("{}-all.jar", inputs.name)),
@@ -227,7 +244,7 @@ fn build_jar(
         );
         jars.extend(resolved.libraries.iter().cloned());
 
-        build_fat_jar(inputs, &jars, main_class, &artifact)?;
+        build_fat_jar(inputs, &jars, main_class, &relocations, &artifact)?;
     }
 
     inputs.finish(&fingerprint, &artifact)?;
@@ -235,11 +252,12 @@ fn build_jar(
     return Ok((jar, artifact));
 }
 
-/// The jars merged into `output`
+/// The jars merged into `output`, the packages of `relocations` (from, to) moved
 fn build_fat_jar(
     inputs: &ModuleBuildInputs,
     jars: &[PathBuf],
     main_class: Option<&str>,
+    relocations: &[(String, String)],
     output: &Path,
 ) -> Result<(), String> {
     let work_dir = inputs.directory.join("build/tmp/fat-jar");
@@ -264,7 +282,21 @@ fn build_fat_jar(
     let manifest_file = work_dir.join("MANIFEST.MF");
     system::write_file(&manifest_file, &jar_manifest(main_class, &[], multi_release))?;
 
-    return create_jar(&inputs.jdk, output, Some(&manifest_file), &[&contents]);
+    if relocations.is_empty() {
+        return create_jar(&inputs.jdk, output, Some(&manifest_file), &[&contents]);
+    }
+
+    system::log(
+        &inputs.name,
+        &format!("Relocating {} package(s) with jar-relocator", relocations.len()),
+    );
+
+    jar_merge::relocate_service_files(&contents, relocations)?;
+
+    let unrelocated = work_dir.join("unrelocated.jar");
+    create_jar(&inputs.jdk, &unrelocated, Some(&manifest_file), &[&contents])?;
+
+    return jar_merge::relocate(inputs, &unrelocated, output, relocations);
 }
 
 /// Returns their file names for the Class-Path
