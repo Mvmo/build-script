@@ -38,6 +38,8 @@ pub struct BuildScriptContext {
     pub project_dir: PathBuf,
     /// modules that run their tests once they are built, `build-script test`
     pub tests: TestSelection,
+    /// `build-script build --release`: Android apps are built for release
+    pub release: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +109,7 @@ impl Runtime {
             context: BuildScriptContext {
                 project_dir,
                 tests: TestSelection::None,
+                release: false,
             },
             built: vec![],
             jobs: Arc::new(Jobs::new(default_jobs())),
@@ -125,6 +128,11 @@ impl Runtime {
 
     pub fn with_tests(mut self, tests: TestSelection) -> Self {
         self.context.tests = tests;
+        return self;
+    }
+
+    pub fn with_release(mut self, release: bool) -> Self {
+        self.context.release = release;
         return self;
     }
 

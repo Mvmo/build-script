@@ -38,6 +38,38 @@ const ABIS: &[&str] = &["armeabi-v7a", "arm64-v8a", "x86", "x86_64"];
 /// the CMake builds, and the libraries in libs/<abi> like jniLibs
 const CMAKE_DIR: &str = "build/intermediates/cmake";
 
+/// Debug, or release with `build-script build --release`
+#[derive(Clone, Copy, PartialEq)]
+pub enum BuildType {
+    Debug,
+    Release,
+}
+
+impl BuildType {
+    pub fn of(context: &BuildScriptContext) -> Self {
+        return match context.release {
+            true => BuildType::Release,
+            false => BuildType::Debug,
+        };
+    }
+
+    /// Of the output directories and of BuildConfig.BUILD_TYPE
+    pub fn name(self) -> &'static str {
+        return match self {
+            BuildType::Debug => "debug",
+            BuildType::Release => "release",
+        };
+    }
+}
+
+/// What an apk is signed with
+pub enum Signature {
+    /// the debug key every Android tool uses
+    Debug,
+    /// a release build without a key in the script
+    Unsigned,
+}
+
 /// What aapt2 links: the app, or a library with or without the resources of its libraries
 #[derive(Clone, Copy, PartialEq)]
 pub enum LinkedResources {
@@ -54,7 +86,8 @@ pub struct AndroidBuild {
     pub compile_sdk: i64,
     pub sdk: AndroidSdk,
     pub main_dir: PathBuf,
-    /// debug, or debugAndroidTest for the module with its instrumented tests
+    pub build_type: BuildType,
+    /// debug, release, or debugAndroidTest for the module with its instrumented tests
     variant: &'static str,
     pub build_dir: PathBuf,
     /// own res directories that contain files, lowest priority first
@@ -178,9 +211,13 @@ pub fn android_input_paths(
 }
 
 impl AndroidBuild {
-    pub fn prepare(inputs: ModuleBuildInputs, args: &Arguments) -> Result<Self, String> {
+    pub fn prepare(
+        inputs: ModuleBuildInputs,
+        args: &Arguments,
+        build_type: BuildType,
+    ) -> Result<Self, String> {
         let build_dir = inputs.directory.join("build");
-        return Self::prepare_variant(inputs, args, "debug", build_dir);
+        return Self::prepare_variant(inputs, args, build_type, build_type.name(), build_dir);
     }
 
     /// The module with its instrumented tests, built apart from the module: the
@@ -190,7 +227,8 @@ impl AndroidBuild {
         args: &Arguments,
     ) -> Result<Self, String> {
         let build_dir = inputs.directory.join("build/androidTest");
-        let mut build = Self::prepare_variant(inputs, args, "debugAndroidTest", build_dir)?;
+        let mut build =
+            Self::prepare_variant(inputs, args, BuildType::Debug, "debugAndroidTest", build_dir)?;
         let test_dir = build.inputs.directory.join("src/androidTest");
         build.res_dirs.extend(
             [test_dir.join("res")]
@@ -209,6 +247,7 @@ impl AndroidBuild {
     fn prepare_variant(
         inputs: ModuleBuildInputs,
         args: &Arguments,
+        build_type: BuildType,
         variant: &'static str,
         build_dir: PathBuf,
     ) -> Result<Self, String> {
@@ -253,6 +292,7 @@ impl AndroidBuild {
             compile_sdk,
             sdk,
             main_dir: inputs.directory.join("src/main"),
+            build_type,
             variant,
             build_dir,
             res_dirs: existing_dirs(&inputs, args, "res_dirs")?,
@@ -463,12 +503,12 @@ impl AndroidBuild {
         return Ok(files);
     }
 
-    /// Of a debug build in the namespace, like the Gradle plugin writes it:
-    /// `fields` ("Type NAME value"), then build_config_fields
+    /// In the namespace, like the Gradle plugin writes it: `fields` ("Type NAME value"),
+    /// then build_config_fields
     pub fn write_build_config(&self, fields: &[String]) -> Result<PathBuf, String> {
         let mut declarations = vec![
-            "boolean DEBUG true".to_string(),
-            "String BUILD_TYPE debug".to_string(),
+            format!("boolean DEBUG {}", self.build_type == BuildType::Debug),
+            format!("String BUILD_TYPE {}", self.build_type.name()),
         ];
 
         declarations.extend(fields.iter().cloned());
@@ -515,6 +555,7 @@ impl AndroidBuild {
             sdk_root: &self.sdk.root,
             ndk_version: &self.ndk_version,
             min_sdk: self.min_sdk,
+            build_type: self.build_type,
             work_dir: self.inputs.directory.join(CMAKE_DIR),
             accept_license: self.accept_license,
         }
@@ -649,6 +690,7 @@ impl AndroidBuild {
             &self.sdk.d8,
             &self.sdk.android_jar,
             self.min_api(),
+            self.build_type.name(),
             up_to_date::files_hash(&library.jars)?,
             system::read_file(&library.config)?,
         )
@@ -665,7 +707,7 @@ impl AndroidBuild {
                 .java_command(&[self.sdk.d8.clone()], "com.android.tools.r8.L8")?;
 
             command
-                .arg("--debug")
+                .arg(self.dex_mode())
                 .arg("--min-api")
                 .arg(self.min_api().to_string())
                 .arg("--lib")
@@ -749,6 +791,7 @@ impl AndroidBuild {
             &self.sdk.d8,
             &self.sdk.android_jar,
             self.min_api(),
+            self.build_type.name(),
             up_to_date::files_hash(libraries)?,
         )
             .hash(&mut hasher);
@@ -798,7 +841,7 @@ impl AndroidBuild {
             .java_command(&[self.sdk.d8.clone()], "com.android.tools.r8.D8")?;
 
         command
-            .arg("--debug")
+            .arg(self.dex_mode())
             .arg("--min-api")
             .arg(self.min_api().to_string())
             .arg("--lib")
@@ -850,7 +893,7 @@ impl AndroidBuild {
         return Ok(());
     }
 
-    /// Resources, dex, Java resources and native libraries, aligned and signed with the debug key
+    /// Resources, dex, Java resources and native libraries, aligned and signed as `signature` says
     pub fn package(
         &self,
         linked: &Path,
@@ -858,6 +901,7 @@ impl AndroidBuild {
         java_resources: &Path,
         native_libraries: &Path,
         work_dir: &Path,
+        signature: &Signature,
         apk: &Path,
     ) -> Result<(), String> {
         let unaligned = work_dir.join("unaligned.apk");
@@ -913,23 +957,28 @@ impl AndroidBuild {
         system::run_command(&mut zipalign, "zipalign")?;
 
         system::create_parent_dir(apk)?;
-        let keystore = debug_keystore(&self.inputs.jdk)?;
+
         let mut sign = Command::new(self.inputs.jdk.tool_path("java"));
-        sign.arg("-jar")
-            .arg(&self.sdk.apksigner)
-            .arg("sign")
-            .arg("--ks")
-            .arg(&keystore)
-            // the well known password of the debug key every Android tool uses
-            .args([
-                "--ks-pass",
-                "pass:android",
-                "--key-pass",
-                "pass:android",
-                "--ks-key-alias",
-                "androiddebugkey",
-            ])
-            .arg("--min-sdk-version")
+        sign.arg("-jar").arg(&self.sdk.apksigner).arg("sign");
+
+        match signature {
+            Signature::Unsigned => return system::copy_file(&aligned, apk),
+            Signature::Debug => {
+                sign.arg("--ks")
+                    .arg(debug_keystore(&self.inputs.jdk)?)
+                    // the well known password of the debug key every Android tool uses
+                    .args([
+                        "--ks-pass",
+                        "pass:android",
+                        "--key-pass",
+                        "pass:android",
+                        "--ks-key-alias",
+                        "androiddebugkey",
+                    ]);
+            }
+        }
+
+        sign.arg("--min-sdk-version")
             .arg(self.min_sdk.to_string())
             .arg("--out")
             .arg(apk)
@@ -1091,6 +1140,14 @@ impl AndroidBuild {
         }
 
         return Ok(output);
+    }
+
+    /// --debug keeps the debug information in the dex files, --release does not
+    fn dex_mode(&self) -> &'static str {
+        return match self.build_type {
+            BuildType::Debug => "--debug",
+            BuildType::Release => "--release",
+        };
     }
 
     /// API level the dex files are made for
@@ -1302,6 +1359,7 @@ struct CMakeBuild<'a> {
     sdk_root: &'a Path,
     ndk_version: &'a str,
     min_sdk: i64,
+    build_type: BuildType,
     /// CMAKE_DIR of the module
     work_dir: PathBuf,
     accept_license: bool,
@@ -1309,7 +1367,7 @@ struct CMakeBuild<'a> {
 
 impl CMakeBuild<'_> {
     /// Installs the NDK and CMake if needed, then configures and builds the
-    /// libraries for every ABI, a debug build like the Gradle plugin's
+    /// libraries for every ABI, like the Gradle plugin
     fn run(&self, log: &dyn Fn(&str)) -> Result<(), String> {
         let ndk = self.sdk_root.join("ndk").join(self.ndk_version);
         let cmake_home = self.sdk_root.join("cmake").join(CMAKE_VERSION);
@@ -1368,7 +1426,10 @@ impl CMakeBuild<'_> {
                 .arg(format!("-DANDROID_NDK={}", ndk.display()))
                 .arg(format!("-DANDROID_ABI={abi}"))
                 .arg(format!("-DANDROID_PLATFORM=android-{}", self.min_sdk))
-                .arg("-DCMAKE_BUILD_TYPE=Debug")
+                .arg(match self.build_type {
+                    BuildType::Debug => "-DCMAKE_BUILD_TYPE=Debug",
+                    BuildType::Release => "-DCMAKE_BUILD_TYPE=Release",
+                })
                 .arg(format!(
                     "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}",
                     libraries.join(abi).display()

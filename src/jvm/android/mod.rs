@@ -23,8 +23,8 @@ use crate::language::runtime::{
 };
 
 use build::{
-    AndroidBuild, DEFAULT_NDK_VERSION, LinkedResources, android_input_paths, existing_dirs,
-    native_library_dirs, read_android_inputs,
+    AndroidBuild, BuildType, DEFAULT_NDK_VERSION, LinkedResources, Signature, android_input_paths,
+    existing_dirs, native_library_dirs, read_android_inputs,
 };
 use device::InstrumentedTests;
 use generated::SymbolTable;
@@ -164,25 +164,46 @@ fn android_parameters(parameters: FunctionParameters) -> FunctionSignature {
     .returns(Type::Module);
 }
 
-/// A debug apk in build/outputs/apk/debug/<name>-debug.apk: aapt2, kotlinc against
-/// android.jar, d8, aligned and signed with the debug key
+/// An apk in build/outputs/apk/<build type>/: aapt2, kotlinc against android.jar, d8,
+/// aligned and signed with the debug key, unsigned for release
 fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let inputs = read_android_inputs(context, args)?;
+    let build_type = BuildType::of(context);
     let settings = ApkSettings::of_app(args)?;
     let namespace: String = args.get("namespace")?;
     let build_dir = inputs.directory.join("build");
     let manifest = build_dir.join("intermediates/manifest/AndroidManifest.xml");
-    let apk = build_dir.join(format!("outputs/apk/debug/{}-debug.apk", inputs.name));
 
-    let fingerprint =
+    let signature = match build_type {
+        BuildType::Debug => Signature::Debug,
+        BuildType::Release => Signature::Unsigned,
+    };
+
+    let output_name = match signature {
+        Signature::Debug => format!("{}-debug", inputs.name),
+        Signature::Unsigned => format!("{}-release-unsigned", inputs.name),
+    };
+
+    let apk = build_dir
+        .join("outputs/apk")
+        .join(build_type.name())
+        .join(format!("{output_name}.apk"));
+
+    let mut fingerprint =
         inputs.input_fingerprint(&inputs.name, args, &android_input_paths(&inputs, args)?)?;
+    fingerprint.add(build_type.name());
+
+    match signature {
+        Signature::Debug => {}
+        Signature::Unsigned => system::log(&inputs.name, "Release build, unsigned"),
+    }
 
     let (inputs, sdk, merged_manifest) =
         if inputs.is_up_to_date(&fingerprint, &[&apk, &manifest])? {
             let merged_manifest = xml::parse(&system::read_file(&manifest)?)?;
             (inputs, android_sdk(args)?, merged_manifest)
         } else {
-            let build = AndroidBuild::prepare(inputs, args)?;
+            let build = AndroidBuild::prepare(inputs, args, build_type)?;
             let source_manifest = build.main_dir.join("AndroidManifest.xml");
 
             if !source_manifest.is_file() {
@@ -194,6 +215,7 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
                 source_manifest: Some(&source_manifest),
                 test_manifest: None,
                 manifest: &manifest,
+                signature: &signature,
                 output: &apk,
             }
             .build(&build)?;
@@ -208,6 +230,7 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
         application_id: settings.application_id.clone(),
         activity: launcher_activity(&merged_manifest, &namespace),
         min_sdk: args.get("min_sdk")?,
+        signed: !matches!(signature, Signature::Unsigned),
     };
 
     // the app's classes, its R and BuildConfig, its Java resources
@@ -234,6 +257,7 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
 /// its R class, like for an aar.
 fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let inputs = read_android_inputs(context, args)?;
+    let build_type = BuildType::of(context);
     let namespace: String = args.get("namespace")?;
 
     let source_manifest = Some(inputs.directory.join("src/main/AndroidManifest.xml"))
@@ -254,8 +278,9 @@ fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Resu
         view_binding: args.get("view_binding")?,
     };
 
-    let fingerprint =
+    let mut fingerprint =
         inputs.input_fingerprint(&inputs.name, args, &android_input_paths(&inputs, args)?)?;
+    fingerprint.add(build_type.name());
 
     let (inputs, sdk) = if inputs.is_up_to_date(&fingerprint, &[&jar])? {
         // only the tests need the SDK then
@@ -266,7 +291,7 @@ fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Resu
         };
         (inputs, sdk)
     } else {
-        let build = AndroidBuild::prepare(inputs, args)?;
+        let build = AndroidBuild::prepare(inputs, args, build_type)?;
         let intermediates = build.build_dir.join("intermediates");
         let manifest = intermediates.join("manifest/AndroidManifest.xml");
         build.write_manifest(
@@ -365,6 +390,7 @@ struct Apk<'a> {
     test_manifest: Option<&'a XmlElement>,
     /// the merged manifest
     manifest: &'a Path,
+    signature: &'a Signature,
     output: &'a Path,
 }
 
@@ -430,8 +456,6 @@ impl Apk<'_> {
         let linked = intermediates.join("apk/resources.ap_");
 
         let mut extra = vec![
-            // debug builds are debuggable, like with the Gradle plugin
-            "--debug-mode".to_string(),
             "--target-sdk-version".to_string(),
             target_sdk.to_string(),
             "--version-code".to_string(),
@@ -439,6 +463,11 @@ impl Apk<'_> {
             "--version-name".to_string(),
             settings.version_name.clone(),
         ];
+
+        // debug builds are debuggable, like with the Gradle plugin
+        if build.build_type == BuildType::Debug {
+            extra.push("--debug-mode".to_string());
+        }
 
         if settings.application_id != build.namespace {
             extra.extend([
@@ -540,6 +569,7 @@ impl Apk<'_> {
             &java_resources,
             &native_libraries,
             &intermediates.join("apk"),
+            self.signature,
             self.output,
         )?;
 
@@ -680,6 +710,7 @@ fn instrumented_tests(
             source_manifest: source_manifest.as_deref(),
             test_manifest: Some(&test_manifest),
             manifest: &manifest,
+            signature: &Signature::Debug,
             output: &apk,
         }
         .build(&build)?;
