@@ -53,7 +53,7 @@ impl BuildType {
         };
     }
 
-    /// Of the output directories and of BuildConfig.BUILD_TYPE
+    /// Of the source set over src/main and of the output directories
     pub fn name(self) -> &'static str {
         return match self {
             BuildType::Debug => "debug",
@@ -134,6 +134,20 @@ pub fn read_android_inputs(
     args: &Arguments,
 ) -> Result<ModuleBuildInputs, String> {
     let mut inputs = ModuleBuildInputs::read(context, args, Sources::KotlinAndJava)?;
+    let build_type = BuildType::of(context);
+
+    inputs.source_dirs = inputs
+        .source_dirs
+        .iter()
+        .map(|dir| dir_of_build_type(&inputs.directory, dir, build_type))
+        .collect();
+
+    inputs.resources.dirs = inputs
+        .resources
+        .dirs
+        .iter()
+        .map(|dir| dir_of_build_type(&inputs.directory, dir, build_type))
+        .collect();
 
     if args.get::<bool>("view_binding")? {
         inputs.dependencies.libraries.push(MavenCoordinate::new(
@@ -151,21 +165,36 @@ pub fn existing_dirs(
     inputs: &ModuleBuildInputs,
     args: &Arguments,
     name: &str,
+    build_type: BuildType,
 ) -> Result<Vec<PathBuf>, String> {
     let dirs: Vec<String> = args.get(name)?;
     return Ok(dirs
         .iter()
-        .map(|dir| inputs.directory.join(dir))
+        .map(|dir| dir_of_build_type(&inputs.directory, dir, build_type))
         .filter(|dir| system::contains_files(dir))
         .collect());
+}
+
+/// `dir` of the module. The defaults name src/debug, a release build takes src/release instead.
+fn dir_of_build_type(module_dir: &Path, dir: impl AsRef<Path>, build_type: BuildType) -> PathBuf {
+    let dir = module_dir.join(dir);
+
+    if build_type == BuildType::Release {
+        if let Ok(rest) = dir.strip_prefix(module_dir.join("src/debug")) {
+            return module_dir.join("src/release").join(rest);
+        }
+    }
+
+    return dir;
 }
 
 /// The module's jniLibs and, with a CMakeLists.txt, the libraries built from it
 pub fn native_library_dirs(
     inputs: &ModuleBuildInputs,
     args: &Arguments,
+    build_type: BuildType,
 ) -> Result<Vec<PathBuf>, String> {
-    let mut dirs = source_set_dirs_with_files(inputs, "jniLibs");
+    let mut dirs = source_set_dirs_with_files(inputs, "jniLibs", build_type);
 
     if args.get::<Option<String>>("cmake")?.is_some() {
         dirs.push(inputs.directory.join(CMAKE_DIR).join("libs"));
@@ -179,6 +208,7 @@ pub fn native_library_dirs(
 pub fn android_input_paths(
     inputs: &ModuleBuildInputs,
     args: &Arguments,
+    build_type: BuildType,
 ) -> Result<Vec<PathBuf>, String> {
     let mut paths: Vec<PathBuf> = ["res_dirs", "aidl_dirs", "asset_dirs"]
         .iter()
@@ -186,17 +216,13 @@ pub fn android_input_paths(
         .collect::<Result<Vec<_>, _>>()?
         .iter()
         .flatten()
-        .map(|dir| inputs.directory.join(dir))
+        .map(|dir| dir_of_build_type(&inputs.directory, dir, build_type))
         .collect();
 
-    for source_set in ["src/main", "src/debug"] {
-        paths.push(
-            inputs
-                .directory
-                .join(source_set)
-                .join("AndroidManifest.xml"),
-        );
-        paths.push(inputs.directory.join(source_set).join("jniLibs"));
+    for source_set in ["main", build_type.name()] {
+        let source_set_dir = inputs.directory.join("src").join(source_set);
+        paths.push(source_set_dir.join("AndroidManifest.xml"));
+        paths.push(source_set_dir.join("jniLibs"));
     }
 
     paths.extend(inputs.resources.inputs());
@@ -295,12 +321,12 @@ impl AndroidBuild {
             build_type,
             variant,
             build_dir,
-            res_dirs: existing_dirs(&inputs, args, "res_dirs")?,
-            asset_dirs: existing_dirs(&inputs, args, "asset_dirs")?,
+            res_dirs: existing_dirs(&inputs, args, "res_dirs", build_type)?,
+            asset_dirs: existing_dirs(&inputs, args, "asset_dirs", build_type)?,
             aidl_dirs: args
                 .get::<Vec<String>>("aidl_dirs")?
                 .iter()
-                .map(|dir| inputs.directory.join(dir))
+                .map(|dir| dir_of_build_type(&inputs.directory, dir, build_type))
                 .collect(),
             aidl_imports: unpacked.aidl_imports,
             view_binding: args.get("view_binding")?,
@@ -312,7 +338,7 @@ impl AndroidBuild {
             module_jars: unpacked.module_jars,
             compile_only: unpacked.compile_only,
             libraries: unpacked.libraries,
-            native_library_dirs: native_library_dirs(&inputs, args)?,
+            native_library_dirs: native_library_dirs(&inputs, args, build_type)?,
             cmake_lists: args
                 .get::<Option<String>>("cmake")?
                 .map(|cmake| inputs.directory.join(cmake)),
@@ -359,23 +385,27 @@ impl AndroidBuild {
             )?,
         };
 
-        // the debug source set wins over main
-        let debug_manifest = self.inputs.directory.join("src/debug/AndroidManifest.xml");
-        if debug_manifest.is_file() {
-            let mut debug = read_manifest_with_placeholders(
-                &debug_manifest,
+        // the source set of the build type wins over main
+        let build_type_manifest = self
+            .inputs
+            .directory
+            .join(format!("src/{}/AndroidManifest.xml", self.build_type.name()));
+
+        if build_type_manifest.is_file() {
+            let mut over_main = read_manifest_with_placeholders(
+                &build_type_manifest,
                 application_id,
                 &self.manifest_placeholders,
             )?;
 
             for (key, value) in &manifest.attributes {
-                if debug.attribute(key).is_none() {
-                    debug.attributes.push((key.clone(), value.clone()));
+                if over_main.attribute(key).is_none() {
+                    over_main.attributes.push((key.clone(), value.clone()));
                 }
             }
 
-            merge_manifest(&mut debug, &manifest);
-            manifest = debug;
+            merge_manifest(&mut over_main, &manifest);
+            manifest = over_main;
         }
 
         if let Some(overlay) = overlay {
@@ -1512,11 +1542,15 @@ fn compile_resources(aapt2: &Path, res_dir: &Path, output: &Path) -> Result<(), 
         .map_err(|error| format!("could not save {}: {error}", output.display()));
 }
 
-/// `name` (jniLibs) of the main and the debug source set where it has files, lowest priority first
-fn source_set_dirs_with_files(inputs: &ModuleBuildInputs, name: &str) -> Vec<PathBuf> {
-    return ["src/main", "src/debug"]
+/// `name` (jniLibs) of the main source set and of the build type's where it has files, lowest priority first
+fn source_set_dirs_with_files(
+    inputs: &ModuleBuildInputs,
+    name: &str,
+    build_type: BuildType,
+) -> Vec<PathBuf> {
+    return ["main", build_type.name()]
         .iter()
-        .map(|source_set| inputs.directory.join(source_set).join(name))
+        .map(|source_set| inputs.directory.join("src").join(source_set).join(name))
         .filter(|dir| system::contains_files(dir))
         .collect();
 }

@@ -189,8 +189,11 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
         .join(build_type.name())
         .join(format!("{output_name}.apk"));
 
-    let mut fingerprint =
-        inputs.input_fingerprint(&inputs.name, args, &android_input_paths(&inputs, args)?)?;
+    let mut fingerprint = inputs.input_fingerprint(
+        &inputs.name,
+        args,
+        &android_input_paths(&inputs, args, build_type)?,
+    )?;
     fingerprint.add(build_type.name());
 
     match signature {
@@ -270,16 +273,19 @@ fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Resu
 
     let android = AndroidResources {
         namespace: namespace.clone(),
-        res_dirs: existing_dirs(&inputs, args, "res_dirs")?,
+        res_dirs: existing_dirs(&inputs, args, "res_dirs", build_type)?,
         manifest: source_manifest.clone(),
         symbols: Some(inputs.directory.join(LIBRARY_SYMBOL_FILE)),
-        asset_dirs: existing_dirs(&inputs, args, "asset_dirs")?,
-        native_library_dirs: native_library_dirs(&inputs, args)?,
+        asset_dirs: existing_dirs(&inputs, args, "asset_dirs", build_type)?,
+        native_library_dirs: native_library_dirs(&inputs, args, build_type)?,
         view_binding: args.get("view_binding")?,
     };
 
-    let mut fingerprint =
-        inputs.input_fingerprint(&inputs.name, args, &android_input_paths(&inputs, args)?)?;
+    let mut fingerprint = inputs.input_fingerprint(
+        &inputs.name,
+        args,
+        &android_input_paths(&inputs, args, build_type)?,
+    )?;
     fingerprint.add(build_type.name());
 
     let (inputs, sdk) = if inputs.is_up_to_date(&fingerprint, &[&jar])? {
@@ -689,7 +695,7 @@ fn instrumented_tests(
         .directory
         .join("build/outputs/androidTest-results/connected");
 
-    let mut input_paths = android_input_paths(&inputs, args)?;
+    let mut input_paths = android_input_paths(&inputs, args, BuildType::Debug)?;
     input_paths.push(inputs.directory.join("src/androidTest"));
 
     let fingerprint =
