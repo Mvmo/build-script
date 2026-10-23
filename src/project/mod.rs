@@ -1,4 +1,6 @@
-// New projects and modules: `build-script new` and `build-script add`, from the templates of the language categories
+// New projects and modules: `build-script new` and `build-script add`, from the templates of the language
+// categories, and libraries for modules: `build-script install`
+mod install;
 mod script;
 
 use std::io::IsTerminal;
@@ -10,6 +12,8 @@ use crate::common::system;
 use crate::jvm::templates;
 pub use crate::jvm::templates::MODULE_KINDS;
 use crate::language::runtime;
+
+pub use install::{DEPENDENCIES, DEPENDENCY_KINDS, install};
 
 /// What a kind of module brings into a project: its files and its build call
 pub struct ModuleTemplate {

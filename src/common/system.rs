@@ -539,6 +539,25 @@ pub fn installing<T>(install: impl FnOnce() -> Result<T, String>) -> Result<T, S
 }
 
 /// One file of a zip archive, like a configuration inside a jar
+/// The names of the entries of a zip archive, like a jar
+pub fn zip_entries(archive: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("unzip")
+        .arg("-Z1")
+        .arg(archive)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not start unzip: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!("{} is no zip archive", archive.display()));
+    }
+
+    return Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect());
+}
+
 pub fn read_zip_entry(archive: &Path, entry: &str) -> Result<Vec<u8>, String> {
     let output = Command::new("unzip")
         .arg("-p")

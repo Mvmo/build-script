@@ -1,6 +1,10 @@
-// Adding a module to a build script: its `use`, its repositories and its build call, placed so apps come last.
-// The script is parsed to find the places, everything else stays as it is written.
-use crate::language::parser::{Expression, ExpressionType, Parser, StatementType, UseTarget};
+// Adding to a build script: a module with its `use`, its repositories and its build call, placed so apps
+// come last, or a library to a module's dependencies. The script is parsed to find the places, everything
+// else stays as it is written.
+use std::sync::Arc;
+
+use crate::language::parser::{Expression, ExpressionType, Parser, Script, StatementType, UseTarget};
+use crate::language::runtime::{self, FunctionSignature, Type, Value};
 
 use super::{ModuleTemplate, NewModule};
 
@@ -214,6 +218,289 @@ fn build_call(
     return lines.join("\n");
 }
 
+/// A build call of a module at the top of a script: `app = build_kotlin("app", ...)`
+pub struct ModuleCall<'a> {
+    /// what its name argument says, else the variable it is assigned to
+    pub name: String,
+    pub function: &'a str,
+    /// whose `use` brought the function
+    pub platform: &'static str,
+    pub signature: Arc<FunctionSignature>,
+    /// where its statement starts: the variables it uses are assigned before
+    pub statement_start: usize,
+    call: &'a Expression,
+    /// by parameter name, positional ones too
+    arguments: Vec<(String, &'a Expression)>,
+}
+
+/// How a library got into the dependencies of a module
+#[derive(Debug, PartialEq)]
+pub enum DependencyChange {
+    Added,
+    /// another version was there
+    Replaced(String),
+    /// with this very version
+    Present,
+}
+
+#[derive(Debug)]
+pub struct DependencyEdit {
+    pub script: String,
+    pub change: DependencyChange,
+    /// whose list(...) changed when the module names a variable: other modules may use it as well
+    pub variable: Option<String>,
+}
+
+/// The build calls of modules at the top level of the script: calls of the
+/// functions of its platforms that build a module
+pub fn module_calls(script: &Script) -> Vec<ModuleCall<'_>> {
+    let mut functions: Vec<(&'static str, &'static str, Arc<FunctionSignature>)> = vec![];
+    let mut calls = vec![];
+
+    for statement in &script.statements {
+        let expression = match &statement.variant {
+            StatementType::Use(UseTarget::Ident(name)) => {
+                let platform = runtime::platforms().find(|platform| platform.name == name.str);
+
+                if let Some(platform) = platform {
+                    for (function, value) in (platform.functions)() {
+                        if let Value::Builtin { signature, .. } = value
+                            && matches!(signature.returns, Type::Module)
+                        {
+                            functions.push((platform.name, function, signature));
+                        }
+                    }
+                }
+                continue;
+            }
+            StatementType::Use(_) => continue,
+            StatementType::Expression(expression) => expression,
+        };
+
+        let (variable, value) = match &expression.variant {
+            ExpressionType::Assignment { target, value } => (identifier(target), value.as_ref()),
+            _ => (None, expression),
+        };
+
+        let ExpressionType::FunctionCall { target, args } = &value.variant else {
+            continue;
+        };
+
+        let Some((platform, function, signature)) = identifier(target)
+            .and_then(|name| functions.iter().find(|(_, function, _)| *function == name))
+        else {
+            continue;
+        };
+
+        let arguments: Vec<(String, &Expression)> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, argument)| match &argument.variant {
+                ExpressionType::Assignment { target, value } => {
+                    Some((identifier(target)?.to_string(), value.as_ref()))
+                }
+                _ => Some((signature.params.params.get(index)?.name.clone(), argument)),
+            })
+            .collect();
+
+        let name = match arguments.iter().find(|(name, _)| name == "name") {
+            Some((_, Expression { variant: ExpressionType::String(name), .. })) => name.clone(),
+            _ => variable.unwrap_or(function).to_string(),
+        };
+
+        calls.push(ModuleCall {
+            name,
+            function,
+            platform,
+            signature: signature.clone(),
+            statement_start: statement.span.start,
+            call: value,
+            arguments,
+        });
+    }
+
+    return calls;
+}
+
+impl ModuleCall<'_> {
+    pub fn argument(&self, parameter: &str) -> Option<&Expression> {
+        return self
+            .arguments
+            .iter()
+            .find(|(name, _)| name == parameter)
+            .map(|(_, argument)| *argument);
+    }
+
+    pub fn has_parameter(&self, parameter: &str) -> bool {
+        return self.signature.params.params.iter().any(|param| param.name == parameter);
+    }
+
+    /// The variable the argument names, if it does
+    pub fn variable(&self, parameter: &str) -> Option<&str> {
+        return self.argument(parameter).and_then(identifier);
+    }
+}
+
+/// The script with `notation` (group:artifact:version) in the list `parameter`
+/// of the module. A list a variable holds is changed where the variable is
+/// assigned, a missing argument is added to the call.
+pub fn with_dependency(
+    source: &str,
+    script: &Script,
+    module: &ModuleCall,
+    parameter: &str,
+    notation: &str,
+) -> Result<DependencyEdit, String> {
+    let quoted = format!("\"{notation}\"");
+
+    let Some(argument) = module.argument(parameter) else {
+        let ExpressionType::FunctionCall { target, args } = &module.call.variant else {
+            unreachable!("a module call is a function call");
+        };
+
+        let argument = format!("{parameter} = list({quoted})");
+        let edits = appended(source, target, module.call, args, &argument);
+
+        return Ok(DependencyEdit {
+            script: apply(source, edits),
+            change: DependencyChange::Added,
+            variable: None,
+        });
+    };
+
+    let variable = identifier(argument);
+
+    let list = match variable {
+        Some(variable) => assigned(script, variable, module.statement_start).ok_or_else(|| {
+            format!(
+                "{} names {variable} as its {parameter}, which is assigned nowhere before",
+                module.name
+            )
+        })?,
+        None => argument,
+    };
+
+    let ExpressionType::FunctionCall { target, args } = &list.variant else {
+        return Err(not_a_list(module, parameter, notation));
+    };
+
+    if identifier(target) != Some("list") {
+        return Err(not_a_list(module, parameter, notation));
+    }
+
+    let library = library_of(notation);
+
+    let existing = args.iter().find_map(|argument| match &argument.variant {
+        ExpressionType::String(present) if library_of(present) == library => {
+            Some((argument, present))
+        }
+        _ => None,
+    });
+
+    let (script, change) = match existing {
+        Some((_, present)) if present == notation => {
+            (source.to_string(), DependencyChange::Present)
+        }
+        Some((argument, present)) => {
+            let mut script = source.to_string();
+            script.replace_range(argument.span.start..argument.span.end, &quoted);
+            (script, DependencyChange::Replaced(present.clone()))
+        }
+        None => (
+            apply(source, appended(source, target, list, args, &quoted)),
+            DependencyChange::Added,
+        ),
+    };
+
+    return Ok(DependencyEdit {
+        script,
+        change,
+        variable: variable.map(str::to_string),
+    });
+}
+
+fn not_a_list(module: &ModuleCall, parameter: &str, notation: &str) -> String {
+    return format!(
+        "the {parameter} of {} are no list(...) install can add to, add \"{notation}\" yourself",
+        module.name
+    );
+}
+
+/// group:artifact of a notation, which versions do not change
+fn library_of(notation: &str) -> Option<(&str, &str)> {
+    let mut parts = notation.split(':');
+    return Some((parts.next()?, parts.next()?));
+}
+
+/// The value of the last top level assignment to `variable` before `before`
+fn assigned<'a>(script: &'a Script, variable: &str, before: usize) -> Option<&'a Expression> {
+    return script
+        .statements
+        .iter()
+        .take_while(|statement| statement.span.start < before)
+        .filter_map(|statement| match &statement.variant {
+            StatementType::Expression(Expression {
+                variant: ExpressionType::Assignment { target, value },
+                ..
+            }) if identifier(target) == Some(variable) => Some(value.as_ref()),
+            _ => None,
+        })
+        .last();
+}
+
+/// `text` as the last argument of a call, in its style: on a line of its own
+/// when the arguments are, with a comma after it when the last one has one
+fn appended(
+    source: &str,
+    target: &Expression,
+    call: &Expression,
+    args: &[Expression],
+    text: &str,
+) -> Vec<(usize, String)> {
+    let open = target.span.end + source[target.span.end..].find('(').unwrap_or(0);
+    let close = call.span.end - 1;
+
+    let Some(last) = args.last() else {
+        return vec![(open + 1, text.to_string())];
+    };
+
+    let after_last = &source[last.span.end..close];
+    let comma = after_last
+        .find(|char: char| !char.is_whitespace())
+        .filter(|index| after_last[*index..].starts_with(','))
+        .map(|index| last.span.end + index + 1);
+
+    let on_own_lines = source[open..args[0].span.start].contains('\n');
+
+    if !on_own_lines {
+        return match comma {
+            Some(comma) => vec![(comma, format!(" {text}"))],
+            None => vec![(last.span.end, format!(", {text}"))],
+        };
+    }
+
+    let line = start_of_line(source, last.span.start);
+    let indent: String = source[line..]
+        .chars()
+        .take_while(|char| *char == ' ' || *char == '\t')
+        .collect();
+
+    // after a comment that ends the line of the last argument
+    let line_end = |from: usize| {
+        source[from..close]
+            .find('\n')
+            .map_or(from, |newline| from + newline)
+    };
+
+    return match comma {
+        Some(comma) => vec![(line_end(comma), format!("\n{indent}{text},"))],
+        None => vec![
+            (last.span.end, ",".to_string()),
+            (line_end(last.span.end), format!("\n{indent}{text}")),
+        ],
+    };
+}
+
 fn apply(source: &str, mut edits: Vec<(usize, String)>) -> String {
     let mut result = source.to_string();
 
@@ -407,5 +694,104 @@ mod tests {
             .unwrap_err()
             .starts_with("line 1:")
         );
+    }
+
+    fn installed(
+        source: &str,
+        module: &str,
+        parameter: &str,
+        notation: &str,
+    ) -> Result<DependencyEdit, String> {
+        let script = Parser::new(source).parse_script().unwrap();
+        let calls = module_calls(&script);
+        let call = calls.iter().find(|call| call.name == module).unwrap();
+        return with_dependency(source, &script, call, parameter, notation);
+    }
+
+    #[test]
+    fn module_calls_map_positional_arguments_by_the_signature() {
+        let source = "use java\nuse android\n\nrepositories = list(google())\nlib = build_java(\"core\", list(), repositories)\napp = build_android(\"app\", \"com.example\", list(lib), repositories)\n";
+        let script = Parser::new(source).parse_script().unwrap();
+        let calls = module_calls(&script);
+
+        let names: Vec<(&str, &str, &str)> = calls
+            .iter()
+            .map(|call| (call.name.as_str(), call.function, call.platform))
+            .collect();
+        assert_eq!(
+            names,
+            [("core", "build_java", "java"), ("app", "build_android", "android")]
+        );
+
+        // the namespace comes before the dependencies of Android modules
+        assert!(matches!(
+            &calls[1].argument("dependencies").unwrap().variant,
+            ExpressionType::FunctionCall { .. }
+        ));
+        assert_eq!(calls[1].variable("repositories"), Some("repositories"));
+        assert!(calls[1].has_parameter("android_test_dependencies"));
+        assert!(!calls[0].has_parameter("android_test_dependencies"));
+    }
+
+    #[test]
+    fn libraries_go_into_the_list_in_its_style() {
+        // a missing argument is added to the call, on a line of its own like the others
+        let source = "use java\n\nplugin = build_java(\n    \"plugin\",\n    list(),\n    list(maven_central()),\n)\n";
+        let edit = installed(source, "plugin", "compile_only", "org.spigotmc:spigot-api:26.3-R0.1-SNAPSHOT").unwrap();
+        assert_eq!(
+            edit.script,
+            "use java\n\nplugin = build_java(\n    \"plugin\",\n    list(),\n    list(maven_central()),\n    compile_only = list(\"org.spigotmc:spigot-api:26.3-R0.1-SNAPSHOT\"),\n)\n"
+        );
+        assert_eq!((edit.change, edit.variable), (DependencyChange::Added, None));
+
+        // empty and one line lists
+        let source = "use kotlin\napp = build_kotlin(\"app\", list(), list(maven_central()), test_dependencies = list(\"a:b:1\"))\n";
+        assert_eq!(
+            installed(source, "app", "dependencies", "g:x:2").unwrap().script,
+            "use kotlin\napp = build_kotlin(\"app\", list(\"g:x:2\"), list(maven_central()), test_dependencies = list(\"a:b:1\"))\n"
+        );
+        assert_eq!(
+            installed(source, "app", "test_dependencies", "g:x:2").unwrap().script,
+            "use kotlin\napp = build_kotlin(\"app\", list(), list(maven_central()), test_dependencies = list(\"a:b:1\", \"g:x:2\"))\n"
+        );
+
+        // a list in a variable, without a comma after its last entry, which a comment follows
+        let source = "use kotlin\ndeps = list(\n    \"a:b:1\", // first\n    \"c:d:2\" // second\n)\napp = build_kotlin(\"app\", deps, list(maven_central()))\n";
+        let edit = installed(source, "app", "dependencies", "g:x:2").unwrap();
+        assert_eq!(
+            edit.script,
+            "use kotlin\ndeps = list(\n    \"a:b:1\", // first\n    \"c:d:2\", // second\n    \"g:x:2\"\n)\napp = build_kotlin(\"app\", deps, list(maven_central()))\n"
+        );
+        assert_eq!(edit.variable.as_deref(), Some("deps"));
+
+        // with a comma after the last entry, and a comment after that
+        let source = "use kotlin\napp = build_kotlin(\n    \"app\",\n    list(\n        \"a:b:1\", // first\n    ),\n    list(maven_central()),\n)\n";
+        assert_eq!(
+            installed(source, "app", "dependencies", "g:x:2").unwrap().script,
+            "use kotlin\napp = build_kotlin(\n    \"app\",\n    list(\n        \"a:b:1\", // first\n        \"g:x:2\",\n    ),\n    list(maven_central()),\n)\n"
+        );
+    }
+
+    #[test]
+    fn other_versions_are_replaced_and_lists_install_cannot_change_are_refused() {
+        let source = "use kotlin\napp = build_kotlin(\"app\", list(\"a:b:1\", \"g:x:1\"), list(maven_central()))\n";
+
+        let edit = installed(source, "app", "dependencies", "g:x:2").unwrap();
+        assert_eq!(
+            edit.script,
+            "use kotlin\napp = build_kotlin(\"app\", list(\"a:b:1\", \"g:x:2\"), list(maven_central()))\n"
+        );
+        assert_eq!(edit.change, DependencyChange::Replaced("g:x:1".to_string()));
+
+        let edit = installed(source, "app", "dependencies", "g:x:1").unwrap();
+        assert_eq!((edit.script.as_str(), edit.change), (source, DependencyChange::Present));
+
+        let computed = "use kotlin\nextra = list()\napp = build_kotlin(\"app\", list(\"a:b:1\") + extra, list(maven_central()))\n";
+        let error = installed(computed, "app", "dependencies", "g:x:2").unwrap_err();
+        assert!(error.contains("no list(...)"), "{error}");
+
+        let unassigned = "use kotlin\napp = build_kotlin(\"app\", deps, list(maven_central()))\ndeps = list()\n";
+        let error = installed(unassigned, "app", "dependencies", "g:x:2").unwrap_err();
+        assert!(error.contains("assigned nowhere before"), "{error}");
     }
 }

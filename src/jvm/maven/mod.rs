@@ -144,6 +144,40 @@ pub fn repositories(specs: &[String], project_dir: &Path) -> Result<Vec<MavenRep
         .collect();
 }
 
+/// The highest version the repositories have together, a final one when there
+/// is one: milestones, release candidates and SNAPSHOTs only when nothing else is there
+pub fn newest_version(
+    repositories: &[MavenRepository],
+    coordinate: &MavenCoordinate,
+) -> Result<String, String> {
+    let mut versions: Vec<String> = vec![];
+
+    for repository in repositories {
+        if let Some(metadata) = metadata::fetch(repository, &coordinate.artifact_directory())? {
+            versions.extend(metadata.versions().iter().cloned());
+        }
+    }
+
+    let newest = |stable: bool| {
+        versions
+            .iter()
+            .filter(|version| !stable || is_final(version))
+            .max_by(|left, right| compare_versions(left, right))
+            .cloned()
+    };
+
+    let names: Vec<String> = repositories.iter().map(ToString::to_string).collect();
+
+    return newest(true).or_else(|| newest(false)).ok_or_else(|| {
+        format!(
+            "{}:{} is in none of the repositories ({}), the one that has it goes into the script as maven(url)",
+            coordinate.group,
+            coordinate.artifact,
+            names.join(", ")
+        )
+    });
+}
+
 /// Simplified comparison in the style of Maven's ComparableVersion
 pub fn compare_versions(left: &str, right: &str) -> Ordering {
     let left = version_parts(left);
@@ -240,7 +274,7 @@ impl MavenCoordinate {
     }
 
     /// group/as/path/artifact, with a directory per version below
-    fn artifact_directory(&self) -> String {
+    pub fn artifact_directory(&self) -> String {
         return format!("{}/{}", self.group.replace('.', "/"), self.artifact);
     }
 
@@ -536,6 +570,15 @@ fn version_parts(version: &str) -> Vec<MavenVersionPart> {
     return parts;
 }
 
+/// No alpha, beta, milestone, release candidate or SNAPSHOT. Unknown qualifiers
+/// like the jre of Guava's 33.6.0-jre count as final.
+fn is_final(version: &str) -> bool {
+    return version_parts(version).iter().all(|part| match part {
+        MavenVersionPart::Number(_) => true,
+        MavenVersionPart::Text(text) => qualifier_rank(text).is_none_or(|rank| rank >= RELEASE),
+    });
+}
+
 fn qualifier_rank(qualifier: &str) -> Option<u8> {
     return Some(match qualifier {
         "dev" | "eap" => 0,
@@ -592,6 +635,9 @@ mod tests {
         assert_eq!(compare("1.0.1", "1.0"), Ordering::Greater);
         assert_eq!(compare("33.1.0-jre", "33.0.0-jre"), Ordering::Greater);
         assert_eq!(compare("26.3-R0.1-SNAPSHOT", "26.3-R0.1"), Ordering::Less);
+
+        assert!(is_final("33.6.0-jre") && is_final("1.21-R0.4") && is_final("2.0.0.Final"));
+        assert!(!is_final("2.3.0-Beta1") && !is_final("1.0-RC") && !is_final("26.3-R0.1-SNAPSHOT"));
     }
 
     #[test]

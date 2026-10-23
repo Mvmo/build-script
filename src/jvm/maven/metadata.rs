@@ -1,4 +1,4 @@
-// maven-metadata.xml: which build a SNAPSHOT version stands for, asked for again once a day
+// maven-metadata.xml: the versions of an artifact, and which build a SNAPSHOT version stands for
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
@@ -26,10 +26,19 @@ pub struct MavenMetadata {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct Versioning {
+    versions: Versions,
     snapshot: Snapshot,
     snapshot_versions: SnapshotVersions,
 }
 
+/// Of an artifact: every version the repository has
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Versions {
+    version: Vec<String>,
+}
+
+/// The newest build, the file names follow from it in metadata without <snapshotVersions>
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct Snapshot {
@@ -176,6 +185,11 @@ fn missing_marker(cached: &Path) -> PathBuf {
 impl MavenMetadata {
     pub fn parse(content: &str) -> Result<Self, String> {
         return quick_xml::de::from_str(content).map_err(|error| error.to_string());
+    }
+
+    /// Of an artifact, in the order the repository lists them
+    pub fn versions(&self) -> &[String] {
+        return &self.versioning.versions.version;
     }
 
     /// The version in the name of the newest build of the file, None when it
@@ -367,5 +381,18 @@ mod tests {
         system::write_file(&missing_marker(&cached), "").unwrap();
         assert!(fetch(&repository, "dev/test/nothing").unwrap().is_none());
         std::fs::remove_file(missing_marker(&cached)).unwrap();
+
+        // local repositories have their own name for it
+        let local = std::env::temp_dir().join(format!("build-script-local-{}", std::process::id()));
+        system::write_file(
+            &local.join("dev/test/lib/maven-metadata-local.xml"),
+            "<metadata><versioning><versions><version>1.0</version><version>1.1</version></versions></versioning></metadata>",
+        )
+        .unwrap();
+        let metadata = fetch(&MavenRepository::Local(local.clone()), "dev/test/lib")
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.versions(), ["1.0", "1.1"]);
+        std::fs::remove_dir_all(&local).unwrap();
     }
 }

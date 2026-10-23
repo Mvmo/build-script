@@ -15,10 +15,13 @@ const USAGE: &str = "usage: build-script [build] [<script>]
        build-script test [--module <name>] [<script>]
        build-script new <kind> <path> [--package <package>]
        build-script add <kind> <name> [<script>] [--package <package>]
+       build-script install <group:artifact[:version]> [<script>] [--module <name>]
+                            [--compile-only | --test | --android-test | --processor | --ksp]
        build-script clean [<script>]
        build-script config [<setting> [<value>]] | config --unset <setting>
 build, run and test take --jobs <n>, the number of modules built at the same time;
-they take --refresh, which asks the repositories again for the newest SNAPSHOTs";
+they and install take --refresh, which asks the repositories again for the newest
+versions and SNAPSHOTs";
 
 /// what commands without a script argument build
 const DEFAULT_SCRIPT: &str = "project.build";
@@ -52,6 +55,13 @@ enum Command {
         name: String,
         script: String,
         package: Option<String>,
+    },
+    /// a Maven library into a list of a module's build call, `parameter` names the list
+    Install {
+        library: String,
+        script: String,
+        module: Option<String>,
+        parameter: &'static str,
     },
     /// removes the build directories of the script's modules
     Clean {
@@ -135,6 +145,34 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 package,
             });
         }
+        "install" => {
+            let (module, args) = take_option(rest, "--module")?;
+
+            // a flag names the list the library goes to
+            let (flags, positional): (Vec<String>, Vec<String>) =
+                args.into_iter().partition(|arg| arg.starts_with("--"));
+
+            let parameter = match flags.as_slice() {
+                [] => project::DEPENDENCIES,
+                [flag] => project::DEPENDENCY_KINDS
+                    .iter()
+                    .find(|(known, _)| known == flag)
+                    .map(|(_, parameter)| *parameter)
+                    .ok_or_else(usage)?,
+                _ => return Err(usage()),
+            };
+
+            let [library, script @ ..] = positional.as_slice() else {
+                return Err(usage());
+            };
+
+            return Ok(Command::Install {
+                library: library.clone(),
+                script: script_or_default(script)?,
+                module,
+                parameter,
+            });
+        }
         "config" => match rest {
             [] => {
                 return Ok(Command::Config {
@@ -209,12 +247,21 @@ fn help() -> String {
   new     creates a project in a new directory: {}
   add     adds a module in a directory next to the script and its build call to the
           script: {}
+  install adds a Maven library to the dependencies of the module, the newest version
+          unless one is given, once it resolved for the module; --module picks one in
+          scripts with several, these pick another list than dependencies:
+          {}
   config  shows or changes what new and add remember, like your domain:
           {}
 
 The script is {DEFAULT_SCRIPT} in the current directory unless one is given, see README.md.",
         project::project_kinds().join(", "),
         project::MODULE_KINDS.join(", "),
+        project::DEPENDENCY_KINDS
+            .iter()
+            .map(|(flag, _)| *flag)
+            .collect::<Vec<_>>()
+            .join(", "),
         project::SETTINGS
             .iter()
             .map(|(name, _)| *name)
@@ -279,6 +326,20 @@ fn main() {
             unset,
         } => {
             exit_on_error(config(setting.as_deref(), value.as_deref(), *unset));
+            return;
+        }
+        Command::Install {
+            library,
+            script,
+            module,
+            parameter,
+        } => {
+            exit_on_error(project::install(
+                library,
+                Path::new(script),
+                module.as_deref(),
+                parameter,
+            ));
             return;
         }
         Command::Clean { script } => {
@@ -790,6 +851,27 @@ mod tests {
                 package: Some("org.acme.ui".to_string())
             }),
         );
+
+        assert_eq!(
+            parse(&["install", "org.spigotmc:spigot-api", "--compile-only", "--module", "plugin"]),
+            Ok(Command::Install {
+                library: "org.spigotmc:spigot-api".to_string(),
+                script: DEFAULT_SCRIPT.to_string(),
+                module: Some("plugin".to_string()),
+                parameter: "compile_only"
+            }),
+        );
+        assert_eq!(
+            parse(&["install", "com.google.code.gson:gson:2.14.0", "app/project.build"]),
+            Ok(Command::Install {
+                library: "com.google.code.gson:gson:2.14.0".to_string(),
+                script: "app/project.build".to_string(),
+                module: None,
+                parameter: "dependencies"
+            }),
+        );
+        assert!(parse(&["install", "a:b", "--test", "--ksp"]).is_err());
+        assert!(parse(&["install", "a:b", "--shade"]).is_err());
     }
 
     #[test]
