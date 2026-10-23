@@ -1,4 +1,5 @@
 // Maven: repositories, coordinates, dependency notations and versions, like in Gradle
+mod metadata;
 mod pom;
 mod resolver;
 
@@ -9,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::common::system;
 use crate::language::runtime::{FunctionParams, Type, Value, builtin};
 
+pub use metadata::refresh;
 pub use pom::license_report;
 pub use resolver::DependencyResolver;
 
@@ -215,6 +217,10 @@ impl MavenCoordinate {
                 .unwrap_or_default(),
             classifier: parts.get(3).map(|classifier| classifier.to_string()),
         });
+    }
+
+    pub fn is_snapshot(&self) -> bool {
+        return self.version.ends_with(metadata::SNAPSHOT);
     }
 
     fn module_key(&self) -> MavenModuleKey {
@@ -585,6 +591,7 @@ mod tests {
         assert_eq!(compare("1.0", "1.0.0"), Ordering::Equal);
         assert_eq!(compare("1.0.1", "1.0"), Ordering::Greater);
         assert_eq!(compare("33.1.0-jre", "33.0.0-jre"), Ordering::Greater);
+        assert_eq!(compare("26.3-R0.1-SNAPSHOT", "26.3-R0.1"), Ordering::Less);
     }
 
     #[test]

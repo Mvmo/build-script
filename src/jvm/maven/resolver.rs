@@ -3,11 +3,13 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use serde_json::Value as Json;
 
 use crate::common::system;
 
+use super::metadata::{self, MavenMetadata, SnapshotFile};
 use super::pom::{
     EffectivePom, InheritedPom, LibraryLicense, LicenseReportEntry, PomExclusion, PomFile,
     PomProjectInfo, interpolate, merge_dependencies,
@@ -29,6 +31,8 @@ pub struct DependencyResolver {
     module_metadata: HashMap<PomKey, Option<Rc<Json>>>,
     /// selected variants, None when the POM has to do
     variants: HashMap<PomKey, Option<Rc<GradleVariant>>>,
+    /// maven-metadata.xml of SNAPSHOT versions by repository and directory, None when it has none
+    snapshot_metadata: HashMap<(usize, String), Option<Rc<MavenMetadata>>>,
 }
 
 impl DependencyResolver {
@@ -41,7 +45,30 @@ impl DependencyResolver {
             effective_poms: HashMap::new(),
             module_metadata: HashMap::new(),
             variants: HashMap::new(),
+            snapshot_metadata: HashMap::new(),
         };
+    }
+
+    /// The POMs of the newest builds of SNAPSHOT versions, and when they were
+    /// written. A module that depends on a SNAPSHOT is built again when they change.
+    pub fn snapshot_poms(
+        &mut self,
+        coordinates: &[MavenCoordinate],
+    ) -> Result<Vec<(PathBuf, Option<SystemTime>)>, String> {
+        let mut poms = vec![];
+
+        for coordinate in coordinates.iter().filter(|coordinate| coordinate.is_snapshot()) {
+            let Some(pom) = self.find_in_repositories(&coordinate.pom_path())? else {
+                return Err(format!("{coordinate} was not found in any repository"));
+            };
+
+            // mvn install writes a local SNAPSHOT anew under the same name
+            let modified = pom.metadata().and_then(|metadata| metadata.modified()).ok();
+
+            poms.push((pom, modified));
+        }
+
+        return Ok(poms);
     }
 
     /// Like Gradle platforms: BOM versions fill in roots without a version
@@ -981,34 +1008,66 @@ impl DependencyResolver {
         return Ok(model);
     }
 
-    /// Remote files end up in the cache
-    fn find_in_repositories(&self, path: &str) -> Result<Option<PathBuf>, String> {
-        for repository in &self.repositories {
-            match repository {
+    /// Remote files end up in the cache. A file of a SNAPSHOT version is the
+    /// one of the newest build the repository has.
+    fn find_in_repositories(&mut self, path: &str) -> Result<Option<PathBuf>, String> {
+        let snapshot = SnapshotFile::parse(path);
+
+        for index in 0..self.repositories.len() {
+            let url = match &self.repositories[index] {
+                // mvn install keeps SNAPSHOTs under their plain name
                 MavenRepository::Local(directory) => {
                     let file = directory.join(path);
                     if file.is_file() {
                         return Ok(Some(file));
                     }
+                    continue;
                 }
-                MavenRepository::Remote { url, .. } => {
-                    let file = self.cache_dir.join(path);
+                MavenRepository::Remote { url, .. } => url.clone(),
+            };
 
-                    if file.is_file() {
-                        return Ok(Some(file));
-                    }
+            let build_path = match &snapshot {
+                Some(snapshot) => self.snapshot_build_path(index, snapshot)?,
+                None => None,
+            };
 
-                    let credentials = repository.credentials()?;
-                    let url = format!("{url}/{path}");
+            // timestamped builds never change, so they are cached like releases
+            let path = build_path.as_deref().unwrap_or(path);
+            let file = self.cache_dir.join(path);
 
-                    if system::download(&url, &file, false, credentials.as_ref())? {
-                        return Ok(Some(file));
-                    }
-                }
+            if file.is_file() {
+                return Ok(Some(file));
+            }
+
+            let credentials = self.repositories[index].credentials()?;
+
+            if system::download(&format!("{url}/{path}"), &file, false, credentials.as_ref())? {
+                return Ok(Some(file));
             }
         }
 
         return Ok(None);
+    }
+
+    /// Where the newest build of a SNAPSHOT file is in a repository, None when
+    /// it has no metadata or keeps the plain name
+    fn snapshot_build_path(
+        &mut self,
+        index: usize,
+        snapshot: &SnapshotFile,
+    ) -> Result<Option<String>, String> {
+        let key = (index, snapshot.directory.to_string());
+
+        if !self.snapshot_metadata.contains_key(&key) {
+            let metadata = metadata::fetch(&self.repositories[index], snapshot.directory)?;
+            self.snapshot_metadata.insert(key.clone(), metadata.map(Rc::new));
+        }
+
+        let build = self.snapshot_metadata[&key]
+            .as_ref()
+            .and_then(|metadata| metadata.snapshot_build(snapshot));
+
+        return Ok(build.map(|build| snapshot.path_of_build(&build)));
     }
 }
 

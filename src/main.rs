@@ -17,7 +17,8 @@ const USAGE: &str = "usage: build-script [build] [<script>]
        build-script add <kind> <name> [<script>] [--package <package>]
        build-script clean [<script>]
        build-script config [<setting> [<value>]] | config --unset <setting>
-build, run and test take --jobs <n>, the number of modules built at the same time";
+build, run and test take --jobs <n>, the number of modules built at the same time;
+they take --refresh, which asks the repositories again for the newest SNAPSHOTs";
 
 /// what commands without a script argument build
 const DEFAULT_SCRIPT: &str = "project.build";
@@ -225,7 +226,7 @@ The script is {DEFAULT_SCRIPT} in the current directory unless one is given, see
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let (jobs, args) = take_jobs(&args).unwrap_or_else(|error| {
+    let (options, args) = take_build_options(&args).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(2);
     });
@@ -234,6 +235,10 @@ fn main() {
         eprintln!("{usage}");
         std::process::exit(2);
     });
+
+    if options.refresh {
+        jvm::maven::refresh();
+    }
 
     let script_path = match &command {
         Command::Help => {
@@ -294,7 +299,8 @@ fn main() {
         _ => TestSelection::None,
     };
 
-    let modules = run_script(script_path, tests, jobs.unwrap_or_else(runtime::default_jobs));
+    let jobs = options.jobs.unwrap_or_else(runtime::default_jobs);
+    let modules = run_script(script_path, tests, jobs);
 
     match &command {
         Command::Run { module, args, .. } => {
@@ -305,10 +311,22 @@ fn main() {
     }
 }
 
-/// `--jobs <n>` of the commands that build, before the arguments of a program after `--`
-fn take_jobs(args: &[String]) -> Result<(Option<usize>, Vec<String>), String> {
+/// What the commands that build take besides their own arguments
+#[derive(Debug, Default, PartialEq)]
+struct BuildOptions {
+    /// modules built at the same time
+    jobs: Option<usize>,
+    /// SNAPSHOTs are looked up again instead of once a day
+    refresh: bool,
+}
+
+/// `--jobs <n>` and `--refresh`, before the arguments of a program after `--`
+fn take_build_options(args: &[String]) -> Result<(BuildOptions, Vec<String>), String> {
     let program_args = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
-    let (jobs, mut own) = take_option(&args[..program_args], "--jobs")?;
+    let (jobs, own) = take_option(&args[..program_args], "--jobs")?;
+
+    let refresh = own.iter().any(|arg| arg == "--refresh");
+    let mut own: Vec<String> = own.into_iter().filter(|arg| arg != "--refresh").collect();
     own.extend(args[program_args..].iter().cloned());
 
     let jobs = match jobs {
@@ -321,7 +339,7 @@ fn take_jobs(args: &[String]) -> Result<(Option<usize>, Vec<String>), String> {
         None => None,
     };
 
-    return Ok((jobs, own));
+    return Ok((BuildOptions { jobs, refresh }, own));
 }
 
 /// The modules the script built, the builds of independent modules ran in parallel
@@ -834,18 +852,27 @@ mod tests {
     }
 
     #[test]
-    fn jobs_are_taken_before_the_arguments_of_the_program() {
+    fn build_options_are_taken_before_the_arguments_of_the_program() {
         let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
 
         assert_eq!(
-            take_jobs(&args(&["build", "--jobs", "3"])),
-            Ok((Some(3), args(&["build"])))
+            take_build_options(&args(&["build", "--jobs", "3", "--refresh"])),
+            Ok((
+                BuildOptions {
+                    jobs: Some(3),
+                    refresh: true
+                },
+                args(&["build"])
+            ))
         );
         assert_eq!(
-            take_jobs(&args(&["run", "--", "--jobs", "1"])),
-            Ok((None, args(&["run", "--", "--jobs", "1"])))
+            take_build_options(&args(&["run", "--", "--jobs", "1", "--refresh"])),
+            Ok((
+                BuildOptions::default(),
+                args(&["run", "--", "--jobs", "1", "--refresh"])
+            ))
         );
-        assert!(take_jobs(&args(&["test", "--jobs", "0"])).is_err());
+        assert!(take_build_options(&args(&["test", "--jobs", "0"])).is_err());
     }
 
     #[test]
