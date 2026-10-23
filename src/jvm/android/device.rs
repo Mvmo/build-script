@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::system::{self, HostArch};
+use crate::common::system::{self, HostArchitecture};
 use crate::common::xml::{self, XmlElement};
 use crate::language::runtime::{TestCounts, TestOutcome, TestRunner};
 
@@ -570,12 +570,12 @@ fn system_images(catalog: &SdkCatalog, abi: &str, min_sdk: i64) -> Vec<SystemIma
 }
 
 /// The AVDs build-script set up
-fn list_avds(home: &Path) -> Vec<Avd> {
+fn list_avds(home: &Path) -> Vec<AndroidVirtualDevice> {
     let Ok(entries) = fs::read_dir(home) else {
         return vec![];
     };
 
-    let mut avds: Vec<Avd> = entries
+    let mut avds: Vec<AndroidVirtualDevice> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "ini"))
@@ -589,7 +589,7 @@ fn list_avds(home: &Path) -> Vec<Avd> {
                 .unwrap_or(&name)
                 .to_string();
 
-            return Some(Avd { name, display });
+            return Some(AndroidVirtualDevice { name, display });
         })
         .collect();
 
@@ -658,7 +658,7 @@ fn create_avd(home: &Path, image: &SystemImage) -> Result<String, String> {
 /// The ABI system images need to run fast on this machine
 fn host_abi() -> &'static str {
     match system::host_arch() {
-        Ok(HostArch::Aarch64) => return "arm64-v8a",
+        Ok(HostArchitecture::Aarch64) => return "arm64-v8a",
         _ => return "x86_64",
     }
 }
@@ -887,7 +887,7 @@ impl SystemImage {
 
 /// An emulator (AVD) set up by build-script
 #[derive(Debug, PartialEq)]
-struct Avd {
+struct AndroidVirtualDevice {
     name: String,
     display: String,
 }
@@ -1124,7 +1124,7 @@ INSTRUMENTATION_CODE: -1";
         let avds = list_avds(&home);
         assert_eq!(
             avds,
-            [Avd {
+            [AndroidVirtualDevice {
                 name,
                 display: "Android API 36 (Google Play, arm64-v8a)".to_string()
             }]

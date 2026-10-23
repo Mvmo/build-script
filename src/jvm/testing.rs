@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use crate::common::system;
 use crate::language::runtime::{
-    Args, BuiltModule, FunctionParams, ModuleTests, TestOutcome, TestRun, TestSuite, Type, Value,
+    Arguments, BuiltModule, FunctionParameters, ModuleTests, TestOutcome, TestRun, TestSuite, Type,
+    Value,
 };
 
 use super::ksp::{ResolvedSymbolProcessors, SymbolProcessors};
@@ -62,7 +63,7 @@ const ENGINES: &[Engine] = &[
 /// What the unit tests of a module are compiled and run against
 pub struct UnitTests<'a> {
     pub inputs: &'a ModuleBuildInputs,
-    pub args: &'a Args,
+    pub args: &'a Arguments,
     /// class directories and jars of the module, the tests see their internal declarations
     pub classes: Vec<PathBuf>,
     /// whose variants of the libraries the tests get
@@ -73,7 +74,7 @@ pub struct UnitTests<'a> {
 }
 
 /// Like testImplementation and its kin in Gradle
-pub fn unit_test_params(params: FunctionParams, sources: Sources) -> FunctionParams {
+pub fn unit_test_params(params: FunctionParameters, sources: Sources) -> FunctionParameters {
     let mut params = params
         .with_default(
             "test_dependencies",

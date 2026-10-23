@@ -7,27 +7,27 @@ use crate::language::parser::Expression;
 
 use super::error::{RuntimeError, RuntimeErrorType, snake_case};
 use super::values::{BuiltModule, PendingModule, Type, Value};
-use super::{BuildScriptContext, ScopeRef};
+use super::{BuildScriptContext, SharedScope};
 
-pub type BuiltinFunction = fn(&BuildScriptContext, &Args) -> Result<Value, String>;
+pub type BuiltinFunction = fn(&BuildScriptContext, &Arguments) -> Result<Value, String>;
 
 /// Named, typed parameters of a function, optionally followed by a variadic one.
-/// Built like `FunctionParams::new().required("url", Type::String).returns(Type::String)`.
+/// Built like `FunctionParameters::new().required("url", Type::String).returns(Type::String)`.
 #[derive(Debug, Clone)]
-pub struct FunctionParams {
-    pub params: Vec<FunctionParam>,
-    pub variadic: Option<VariadicParam>,
+pub struct FunctionParameters {
+    pub params: Vec<FunctionParameter>,
+    pub variadic: Option<VariadicParameter>,
 }
 
 #[derive(Debug, Clone)]
-pub struct FunctionParam {
+pub struct FunctionParameter {
     pub name: String,
     pub param_type: Type,
-    pub default: ParamDefault,
+    pub default: ParameterDefault,
 }
 
 #[derive(Debug, Clone)]
-pub enum ParamDefault {
+pub enum ParameterDefault {
     Required,
     /// `name: str?`, read as None
     Optional,
@@ -37,7 +37,7 @@ pub enum ParamDefault {
 
 /// Collects all remaining positional arguments: `values: any...` of print
 #[derive(Debug, Clone)]
-pub struct VariadicParam {
+pub struct VariadicParameter {
     pub name: String,
     pub param_type: Type,
 }
@@ -45,7 +45,7 @@ pub struct VariadicParam {
 /// The type of a function: its parameters and what it returns
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
-    pub params: FunctionParams,
+    pub params: FunctionParameters,
     pub returns: Type,
 }
 
@@ -57,7 +57,7 @@ pub struct UserFunction {
     /// the last expression is the value of a call
     pub(super) body: Vec<Expression>,
     /// where it was defined, the body sees the variables there
-    pub(super) scope: ScopeRef,
+    pub(super) scope: SharedScope,
 }
 
 pub enum CallArgument {
@@ -68,7 +68,7 @@ pub enum CallArgument {
 
 /// The arguments of a call, bound to the parameters, for builtins to read as Rust types
 #[derive(Debug, Hash)]
-pub struct Args {
+pub struct Arguments {
     pub function: String,
     /// one entry per declared parameter, None = omitted optional argument
     pub values: Vec<(String, Option<Value>)>,
@@ -104,10 +104,10 @@ pub fn builtin(
 /// Every argument is checked against the type of its parameter.
 pub fn bind(
     function: &str,
-    params: &FunctionParams,
+    params: &FunctionParameters,
     arguments: Vec<CallArgument>,
     span: Span,
-) -> Result<Args, RuntimeError> {
+) -> Result<Arguments, RuntimeError> {
     let mut slots: Vec<Option<Value>> = vec![None; params.params.len()];
     let mut rest = vec![];
     let mut rest_named = false;
@@ -256,9 +256,9 @@ pub fn bind(
     for (param, slot) in params.params.iter().zip(slots) {
         let value = match (slot, &param.default) {
             (Some(value), _) => Some(value),
-            (None, ParamDefault::Value(default)) => Some(default.clone()),
-            (None, ParamDefault::Optional) => None,
-            (None, ParamDefault::Required) => {
+            (None, ParameterDefault::Value(default)) => Some(default.clone()),
+            (None, ParameterDefault::Optional) => None,
+            (None, ParameterDefault::Required) => {
                 return Err(error(RuntimeErrorType::MissingArgument {
                     function: function.to_string(),
                     param: param.name.clone(),
@@ -269,27 +269,27 @@ pub fn bind(
         values.push((param.name.clone(), value));
     }
 
-    return Ok(Args {
+    return Ok(Arguments {
         function: function.to_string(),
         values,
         rest,
     });
 }
 
-impl FunctionParams {
+impl FunctionParameters {
     pub fn new() -> Self {
-        return FunctionParams {
+        return FunctionParameters {
             params: vec![],
             variadic: None,
         };
     }
 
     pub fn required(self, name: &str, param_type: Type) -> Self {
-        return self.param(name, param_type, ParamDefault::Required);
+        return self.param(name, param_type, ParameterDefault::Required);
     }
 
     pub fn optional(self, name: &str, param_type: Type) -> Self {
-        return self.param(name, param_type, ParamDefault::Optional);
+        return self.param(name, param_type, ParameterDefault::Optional);
     }
 
     pub fn with_default(self, name: &str, param_type: Type, value: impl Into<Value>) -> Self {
@@ -300,12 +300,12 @@ impl FunctionParams {
             value.literal()
         );
 
-        return self.param(name, param_type, ParamDefault::Value(value));
+        return self.param(name, param_type, ParameterDefault::Value(value));
     }
 
     pub fn variadic(mut self, name: &str, param_type: Type) -> Self {
         self.assert_new_name(name);
-        self.variadic = Some(VariadicParam {
+        self.variadic = Some(VariadicParameter {
             name: name.to_string(),
             param_type,
         });
@@ -320,14 +320,14 @@ impl FunctionParams {
         };
     }
 
-    fn param(mut self, name: &str, param_type: Type, default: ParamDefault) -> Self {
+    fn param(mut self, name: &str, param_type: Type, default: ParameterDefault) -> Self {
         self.assert_new_name(name);
         assert!(
             self.variadic.is_none(),
             "'{name}' comes after the variadic parameter"
         );
 
-        self.params.push(FunctionParam {
+        self.params.push(FunctionParameter {
             name: name.to_string(),
             param_type,
             default,
@@ -347,9 +347,9 @@ impl FunctionParams {
     }
 }
 
-impl FunctionParam {
+impl FunctionParameter {
     fn is_required(&self) -> bool {
-        return matches!(self.default, ParamDefault::Required);
+        return matches!(self.default, ParameterDefault::Required);
     }
 }
 
@@ -375,7 +375,7 @@ impl FunctionSignature {
     }
 }
 
-impl Args {
+impl Arguments {
     pub fn get<T: FromValue>(&self, name: &str) -> Result<T, String> {
         let Some((_, value)) = self.values.iter().find(|(param, _)| param == name) else {
             return Err(format!(
@@ -518,7 +518,7 @@ impl<T: FromValue> FromValue for Option<T> {
     }
 }
 
-impl fmt::Display for FunctionParam {
+impl fmt::Display for FunctionParameter {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // parameters of function types have no names: fn(str) -> str
         if !self.name.is_empty() {
@@ -526,16 +526,16 @@ impl fmt::Display for FunctionParam {
         }
 
         match &self.default {
-            ParamDefault::Required => return write!(f, "{}", self.param_type),
-            ParamDefault::Optional => return write!(f, "{}?", self.param_type),
-            ParamDefault::Value(value) => {
+            ParameterDefault::Required => return write!(f, "{}", self.param_type),
+            ParameterDefault::Optional => return write!(f, "{}?", self.param_type),
+            ParameterDefault::Value(value) => {
                 return write!(f, "{} = {}", self.param_type, value.literal());
             }
         }
     }
 }
 
-impl fmt::Display for FunctionParams {
+impl fmt::Display for FunctionParameters {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut parts: Vec<String> = self.params.iter().map(|param| param.to_string()).collect();
 
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn assignments_split_at_the_first_equals_sign() {
-        let args = |entries: &[&str]| Args {
+        let args = |entries: &[&str]| Arguments {
             function: "f".to_string(),
             values: vec![("pairs".to_string(), Some(Value::string_list(entries)))],
             rest: vec![],

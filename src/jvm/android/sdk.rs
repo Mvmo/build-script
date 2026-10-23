@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::common::system::{self, HostArch, HostOs};
+use crate::common::system::{self, HostArchitecture, HostOperatingSystem};
 
 pub const SDK_REPOSITORY: &str = "https://dl.google.com/android/repository";
 
@@ -415,14 +415,14 @@ impl RemotePackage {
     /// For this operating system and architecture
     pub fn archive(&self) -> Option<&Archive> {
         let os = match system::host_os().ok()? {
-            HostOs::MacOs => "macosx",
-            HostOs::Linux => "linux",
-            HostOs::Windows => "windows",
+            HostOperatingSystem::MacOs => "macosx",
+            HostOperatingSystem::Linux => "linux",
+            HostOperatingSystem::Windows => "windows",
         };
 
         let arch = match system::host_arch().ok()? {
-            HostArch::Aarch64 => "aarch64",
-            HostArch::X86_64 => "x64",
+            HostArchitecture::Aarch64 => "aarch64",
+            HostArchitecture::X86_64 => "x64",
         };
 
         return self.archives.archives.iter().find(|archive| {

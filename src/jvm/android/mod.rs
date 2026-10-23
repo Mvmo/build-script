@@ -17,7 +17,7 @@ use crate::jvm::module::{
 };
 use crate::jvm::testing::{UnitTests, unit_test_params};
 use crate::language::runtime::{
-    Args, BuildScriptContext, FunctionParams, FunctionSignature, ModuleTests, TestOutcome,
+    Arguments, BuildScriptContext, FunctionParameters, FunctionSignature, ModuleTests, TestOutcome,
     TestSuite, Type, Value, builtin,
 };
 
@@ -60,7 +60,7 @@ pub struct AndroidResources {
 
 pub fn builtins() -> Vec<(&'static str, Value)> {
     let app = android_params(
-        FunctionParams::new()
+        FunctionParameters::new()
             .required("name", Type::String)
             .required("namespace", Type::String)
             .required("dependencies", dependencies_type())
@@ -77,7 +77,7 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
     );
 
     let library = android_params(
-        FunctionParams::new()
+        FunctionParameters::new()
             .required("name", Type::String)
             .required("namespace", Type::String)
             .required("dependencies", dependencies_type())
@@ -100,7 +100,7 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
 
 /// Those of build_kotlin and those of Android modules. Debug builds: the debug
 /// source set lies over main, like with the Gradle plugin.
-fn android_params(params: FunctionParams) -> FunctionSignature {
+fn android_params(params: FunctionParameters) -> FunctionSignature {
     let source_sets = &["main", "debug"];
     return unit_test_params(
         module_params(params, source_sets, Sources::KotlinAndJava),
@@ -164,7 +164,7 @@ fn android_params(params: FunctionParams) -> FunctionSignature {
 /// A debug apk in build/outputs/apk/debug/<name>-debug.apk: resources with
 /// aapt2, Kotlin against android.jar, dex with d8, aligned and signed with
 /// the debug key
-fn build_android(context: &BuildScriptContext, args: &Args) -> Result<Value, String> {
+fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let inputs = read_android_inputs(context, args)?;
     let settings = ApkSettings::of_app(args)?;
     let namespace: String = args.get("namespace")?;
@@ -230,7 +230,7 @@ fn build_android(context: &BuildScriptContext, args: &Args) -> Result<Value, Str
 
 /// build/libs/<name>.jar. Apps using it compile its resources and generate
 /// its R class, like for an aar.
-fn build_android_library(context: &BuildScriptContext, args: &Args) -> Result<Value, String> {
+fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let inputs = read_android_inputs(context, args)?;
     let namespace: String = args.get("namespace")?;
 
@@ -367,7 +367,7 @@ struct Apk<'a> {
 }
 
 impl ApkSettings {
-    fn of_app(args: &Args) -> Result<Self, String> {
+    fn of_app(args: &Arguments) -> Result<Self, String> {
         let namespace: String = args.get("namespace")?;
 
         let application_id = args
@@ -553,7 +553,7 @@ fn app_launch(
     };
 }
 
-fn android_sdk(args: &Args) -> Result<AndroidSdk, String> {
+fn android_sdk(args: &Arguments) -> Result<AndroidSdk, String> {
     return AndroidSdk::ensure(
         args.get("compile_sdk")?,
         &args.get::<String>("build_tools")?,
@@ -565,7 +565,7 @@ fn android_sdk(args: &Args) -> Result<AndroidSdk, String> {
 /// src/androidTest in an apk, which runs on a device once the script is built
 fn android_tests(
     context: &BuildScriptContext,
-    args: &Args,
+    args: &Arguments,
     inputs: &ModuleBuildInputs,
     sdk: &AndroidSdk,
     classes: Vec<PathBuf>,
@@ -604,7 +604,7 @@ fn android_tests(
 /// it takes the place of the app on the device while the tests run.
 fn instrumented_tests(
     context: &BuildScriptContext,
-    args: &Args,
+    args: &Arguments,
     sdk: &AndroidSdk,
     settings: &ApkSettings,
 ) -> Result<ModuleTests, String> {

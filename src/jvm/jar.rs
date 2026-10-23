@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::common::system;
 use crate::language::runtime::{
-    Args, BuildScriptContext, BuiltModule, FunctionParams, FunctionSignature, Type, Value, builtin,
+    Arguments, BuildScriptContext, BuiltModule, FunctionParameters, FunctionSignature, Type, Value,
+    builtin,
 };
 
 use super::JvmLaunch;
@@ -40,7 +41,7 @@ pub fn java_builtins() -> Vec<(&'static str, Value)> {
 fn jar_params(sources: Sources) -> FunctionSignature {
     return unit_test_params(
         module_params(
-            FunctionParams::new()
+            FunctionParameters::new()
                 .required("name", Type::String)
                 .required("dependencies", dependencies_type())
                 .required("repositories", Type::list(Type::String))
@@ -56,7 +57,7 @@ fn jar_params(sources: Sources) -> FunctionSignature {
 /// build/libs/<name>.jar, its runtime libraries in build/libs/lib
 fn build_module(
     context: &BuildScriptContext,
-    args: &Args,
+    args: &Arguments,
     sources: Sources,
 ) -> Result<Value, String> {
     let inputs = ModuleBuildInputs::read(context, args, sources)?;
@@ -104,7 +105,7 @@ fn build_module(
 
 fn build_jar(
     inputs: &ModuleBuildInputs,
-    args: &Args,
+    args: &Arguments,
     main_class: Option<&str>,
 ) -> Result<PathBuf, String> {
     let build_dir = inputs.directory.join("build");

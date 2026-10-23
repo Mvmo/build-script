@@ -14,48 +14,48 @@ const BUILD_SCRIPT_DIR_NAME: &str = "build-script";
 const DEFAULT_BUILD_SCRIPT_HOME_DIR_NAME: &str = ".build-script";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HostOs {
+pub enum HostOperatingSystem {
     MacOs,
     Linux,
     Windows,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HostArch {
+pub enum HostArchitecture {
     Aarch64,
     X86_64,
 }
 
-pub fn host_os() -> Result<HostOs, String> {
+pub fn host_os() -> Result<HostOperatingSystem, String> {
     match std::env::consts::OS {
-        "macos" => return Ok(HostOs::MacOs),
-        "linux" => return Ok(HostOs::Linux),
-        "windows" => return Ok(HostOs::Windows),
+        "macos" => return Ok(HostOperatingSystem::MacOs),
+        "linux" => return Ok(HostOperatingSystem::Linux),
+        "windows" => return Ok(HostOperatingSystem::Windows),
         other => return Err(format!("the operating system {other} is not supported")),
     }
 }
 
-pub fn host_arch() -> Result<HostArch, String> {
+pub fn host_arch() -> Result<HostArchitecture, String> {
     match std::env::consts::ARCH {
-        "aarch64" => return Ok(HostArch::Aarch64),
-        "x86_64" => return Ok(HostArch::X86_64),
+        "aarch64" => return Ok(HostArchitecture::Aarch64),
+        "x86_64" => return Ok(HostArchitecture::X86_64),
         other => return Err(format!("the CPU architecture {other} is not supported")),
     }
 }
 
 /// JDKs, the Android SDK and emulators: below $BUILD_SCRIPT_HOME, $XDG_DATA_HOME/build-script or ~/.build-script
 pub fn data_dir(name: &str) -> PathBuf {
-    return BuildHomeEnv::read().base_dir(BaseDirType::Data).join(name);
+    return BuildHomeEnvironment::read().base_dir(BaseDirectory::Data).join(name);
 }
 
 /// Downloaded artifacts, like ~/.gradle/caches
 pub fn cache_dir(name: &str) -> PathBuf {
-    return BuildHomeEnv::read().base_dir(BaseDirType::Cache).join(name);
+    return BuildHomeEnvironment::read().base_dir(BaseDirectory::Cache).join(name);
 }
 
 /// personal configurations: below $BUILD_SCRIPT_HOME, $XDG_CONFIG_HOME/build-script or ~/.build-script
 pub fn config_dir() -> PathBuf {
-    return BuildHomeEnv::read().base_dir(BaseDirType::Config);
+    return BuildHomeEnvironment::read().base_dir(BaseDirectory::Config);
 }
 
 pub fn user_home_dir() -> PathBuf {
@@ -575,7 +575,7 @@ pub fn read_zip_entry(archive: &Path, entry: &str) -> Result<Vec<u8>, String> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum BaseDirType {
+enum BaseDirectory {
     Data,
     Cache,
     Config,
@@ -583,7 +583,7 @@ enum BaseDirType {
 
 /// The environment variables the build home depends on
 #[derive(Debug, Default)]
-struct BuildHomeEnv {
+struct BuildHomeEnvironment {
     home: Option<OsString>,
     build_script_home: Option<OsString>,
     xdg_data_home: Option<OsString>,
@@ -591,9 +591,9 @@ struct BuildHomeEnv {
     xdg_config_home: Option<OsString>,
 }
 
-impl BuildHomeEnv {
+impl BuildHomeEnvironment {
     fn read() -> Self {
-        return BuildHomeEnv {
+        return BuildHomeEnvironment {
             home: std::env::var_os("HOME"),
             build_script_home: std::env::var_os("BUILD_SCRIPT_HOME"),
             xdg_data_home: std::env::var_os("XDG_DATA_HOME"),
@@ -605,7 +605,7 @@ impl BuildHomeEnv {
     /// $BUILD_SCRIPT_HOME keeps everything in one directory with the caches in
     /// caches/, like ~/.gradle. Without it $XDG_DATA_HOME, $XDG_CACHE_HOME and
     /// $XDG_CONFIG_HOME decide, each one that is not set falls back to ~/.build-script.
-    fn base_dir(&self, base_dir_type: BaseDirType) -> PathBuf {
+    fn base_dir(&self, base_dir_type: BaseDirectory) -> PathBuf {
         let build_script_home = self
             .build_script_home
             .as_deref()
@@ -614,9 +614,9 @@ impl BuildHomeEnv {
 
         if build_script_home.is_none() {
             let xdg_base_dir = match base_dir_type {
-                BaseDirType::Data => self.xdg_data_home.as_deref(),
-                BaseDirType::Cache => self.xdg_cache_home.as_deref(),
-                BaseDirType::Config => self.xdg_config_home.as_deref(),
+                BaseDirectory::Data => self.xdg_data_home.as_deref(),
+                BaseDirectory::Cache => self.xdg_cache_home.as_deref(),
+                BaseDirectory::Config => self.xdg_config_home.as_deref(),
             };
 
             // the specification asks to ignore relative paths
@@ -633,8 +633,8 @@ impl BuildHomeEnv {
         });
 
         return match base_dir_type {
-            BaseDirType::Data | BaseDirType::Config => build_script_home,
-            BaseDirType::Cache => build_script_home.join("caches"),
+            BaseDirectory::Data | BaseDirectory::Config => build_script_home,
+            BaseDirectory::Cache => build_script_home.join("caches"),
         };
     }
 }
@@ -649,17 +649,17 @@ fn home_or_current_dir(home: Option<&OsStr>) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn home_a() -> BuildHomeEnv {
-        return BuildHomeEnv {
+    fn home_a() -> BuildHomeEnvironment {
+        return BuildHomeEnvironment {
             home: Some("/home/a".into()),
-            ..BuildHomeEnv::default()
+            ..BuildHomeEnvironment::default()
         };
     }
 
-    fn base_dirs(env: BuildHomeEnv) -> (PathBuf, PathBuf) {
+    fn base_dirs(env: BuildHomeEnvironment) -> (PathBuf, PathBuf) {
         return (
-            env.base_dir(BaseDirType::Data),
-            env.base_dir(BaseDirType::Cache),
+            env.base_dir(BaseDirectory::Data),
+            env.base_dir(BaseDirectory::Cache),
         );
     }
 
@@ -674,7 +674,7 @@ mod tests {
         );
 
         assert_eq!(
-            base_dirs(BuildHomeEnv {
+            base_dirs(BuildHomeEnvironment {
                 xdg_data_home: Some("/data".into()),
                 xdg_cache_home: Some("/cache".into()),
                 ..home_a()
@@ -687,7 +687,7 @@ mod tests {
 
         // each XDG variable on its own, the other one falls back
         assert_eq!(
-            base_dirs(BuildHomeEnv {
+            base_dirs(BuildHomeEnvironment {
                 xdg_data_home: Some("/data".into()),
                 ..home_a()
             }),
@@ -699,7 +699,7 @@ mod tests {
 
         // relative paths do not count
         assert_eq!(
-            base_dirs(BuildHomeEnv {
+            base_dirs(BuildHomeEnvironment {
                 xdg_cache_home: Some("cache".into()),
                 ..home_a()
             })
@@ -709,21 +709,21 @@ mod tests {
 
         // settings go with the data, or to $XDG_CONFIG_HOME
         assert_eq!(
-            home_a().base_dir(BaseDirType::Config),
+            home_a().base_dir(BaseDirectory::Config),
             PathBuf::from("/home/a/.build-script")
         );
         assert_eq!(
-            BuildHomeEnv {
+            BuildHomeEnvironment {
                 xdg_config_home: Some("/config".into()),
                 ..home_a()
             }
-            .base_dir(BaseDirType::Config),
+            .base_dir(BaseDirectory::Config),
             PathBuf::from("/config/build-script")
         );
 
         // one directory for everything wins over XDG
         assert_eq!(
-            base_dirs(BuildHomeEnv {
+            base_dirs(BuildHomeEnvironment {
                 xdg_data_home: Some("/data".into()),
                 build_script_home: Some("/bs".into()),
                 ..home_a()

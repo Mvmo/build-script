@@ -6,8 +6,10 @@ use std::process::Command;
 
 use serde_json::Value as Json;
 
-use crate::common::system::{self, HostArch, HostOs};
-use crate::language::runtime::{Args, BuildScriptContext, FunctionParams, Type, Value, builtin};
+use crate::common::system::{self, HostArchitecture, HostOperatingSystem};
+use crate::language::runtime::{
+    Arguments, BuildScriptContext, FunctionParameters, Type, Value, builtin,
+};
 
 pub const DEFAULT_JAVA_VERSION: &str = "21";
 pub const DEFAULT_JDK_DISTRIBUTION: &str = "temurin";
@@ -23,7 +25,7 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
         "jdk",
         builtin(
             "jdk",
-            FunctionParams::new()
+            FunctionParameters::new()
                 .with_default("version", Type::String, DEFAULT_JAVA_VERSION)
                 .with_default("distribution", Type::String, DEFAULT_JDK_DISTRIBUTION)
                 .returns(Type::String),
@@ -113,7 +115,7 @@ impl Jdk {
 }
 
 /// Returns the directory of the JDK
-fn jdk(context: &BuildScriptContext, args: &Args) -> Result<Value, String> {
+fn jdk(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let jdk = Jdk::resolve(
         &args.get::<String>("version")?,
         &args.get::<String>("distribution")?,
@@ -227,14 +229,14 @@ struct FoojayPlatform {
 impl FoojayPlatform {
     fn current() -> Result<Self, String> {
         let os = match system::host_os()? {
-            HostOs::MacOs => "macos",
-            HostOs::Linux => "linux",
-            HostOs::Windows => "windows",
+            HostOperatingSystem::MacOs => "macos",
+            HostOperatingSystem::Linux => "linux",
+            HostOperatingSystem::Windows => "windows",
         };
 
         let arch = match system::host_arch()? {
-            HostArch::Aarch64 => "aarch64",
-            HostArch::X86_64 => "x64",
+            HostArchitecture::Aarch64 => "aarch64",
+            HostArchitecture::X86_64 => "x64",
         };
 
         let archive_type = if os == "windows" { "zip" } else { "tar.gz" };

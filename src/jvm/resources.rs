@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::common::system;
-use crate::language::runtime::Args;
+use crate::language::runtime::Arguments;
 
 /// Files Gradle leaves out of resource directories by default
 const DEFAULT_EXCLUDES: &[&str] = &[
@@ -32,7 +32,7 @@ pub struct JavaResources {
 
 impl JavaResources {
     /// resource_dirs, resource_files, resource_texts and resource_tokens, paths relative to `directory`
-    pub fn read(args: &Args, directory: &Path) -> Result<Self, String> {
+    pub fn read(args: &Arguments, directory: &Path) -> Result<Self, String> {
         let dirs = args
             .get::<Vec<String>>("resource_dirs")?
             .iter()

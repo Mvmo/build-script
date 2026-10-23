@@ -14,10 +14,12 @@ use crate::language::parser::{
     TypeExpression, TypeExpressionType, UnaryOperator, UseTarget,
 };
 
-use functions::{BuiltinFunction, CallArgument, FunctionParam, UserFunction, bind};
+use functions::{BuiltinFunction, CallArgument, FunctionParameter, UserFunction, bind};
 
 pub use error::{RuntimeError, RuntimeErrorType};
-pub use functions::{Args, FromValue, FunctionParams, FunctionSignature, ParamDefault, builtin};
+pub use functions::{
+    Arguments, FromValue, FunctionParameters, FunctionSignature, ParameterDefault, builtin,
+};
 pub use values::{
     BuildFailure, BuiltModule, ModuleOutput, ModuleTests, PendingModule, TestCounts, TestOutcome,
     TestRun, TestRunner, TestSuite, Type, Value, launch,
@@ -48,7 +50,7 @@ pub enum TestSelection {
 
 pub struct Runtime {
     /// the scope of the script, or of the function being called
-    scope: ScopeRef,
+    scope: SharedScope,
     context: BuildScriptContext,
     /// every module a builtin returned, in build order, maybe still building
     built: Vec<Arc<PendingModule>>,
@@ -535,7 +537,7 @@ impl Runtime {
         returns: Option<&TypeExpression>,
         body: &[Expression],
     ) -> Result<Value, RuntimeError> {
-        let mut declared = FunctionParams::new();
+        let mut declared = FunctionParameters::new();
 
         for param in params {
             let param_name = &param.name.str;
@@ -569,12 +571,12 @@ impl Runtime {
                             expression.span,
                         ));
                     }
-                    ParamDefault::Value(value)
+                    ParameterDefault::Value(value)
                 }
-                None => ParamDefault::Required,
+                None => ParameterDefault::Required,
             };
 
-            declared.params.push(FunctionParam {
+            declared.params.push(FunctionParameter {
                 name: param_name.clone(),
                 param_type,
                 default,
@@ -623,13 +625,13 @@ impl Runtime {
                 ));
             }
             TypeExpressionType::Function { params, returns } => {
-                let mut signature = FunctionParams::new();
+                let mut signature = FunctionParameters::new();
 
                 for param in params {
-                    signature.params.push(FunctionParam {
+                    signature.params.push(FunctionParameter {
                         name: String::new(),
                         param_type: Self::resolve_type(param)?,
-                        default: ParamDefault::Required,
+                        default: ParameterDefault::Required,
                     });
                 }
 
@@ -683,7 +685,12 @@ impl Runtime {
     }
 
     /// Once the modules it depends on are built, without holding a job while it waits
-    fn build_in_background(&self, module: Arc<PendingModule>, function: BuiltinFunction, args: Args) {
+    fn build_in_background(
+        &self,
+        module: Arc<PendingModule>,
+        function: BuiltinFunction,
+        args: Arguments,
+    ) {
         let context = self.context.clone();
         let jobs = self.jobs.clone();
 
@@ -776,22 +783,22 @@ impl Runtime {
     }
 }
 
-type ScopeRef = Arc<Mutex<Scope>>;
+type SharedScope = Arc<Mutex<Scope>>;
 
 /// The variables of the script or of a function call
 #[derive(Default)]
 struct Scope {
     variables: HashMap<String, Value>,
     /// where names that are not defined here are looked up
-    parent: Option<ScopeRef>,
+    parent: Option<SharedScope>,
 }
 
 impl Scope {
-    fn root() -> ScopeRef {
+    fn root() -> SharedScope {
         return Arc::new(Mutex::new(Scope::default()));
     }
 
-    fn child(parent: &ScopeRef) -> ScopeRef {
+    fn child(parent: &SharedScope) -> SharedScope {
         return Arc::new(Mutex::new(Scope {
             variables: HashMap::new(),
             parent: Some(parent.clone()),
@@ -857,7 +864,7 @@ fn core_functions() -> Vec<(&'static str, Value)> {
             "print",
             builtin(
                 "print",
-                FunctionParams::new()
+                FunctionParameters::new()
                     .variadic("values", Type::Any)
                     .returns(Type::Unit),
                 |_, args| {
@@ -875,7 +882,7 @@ fn core_functions() -> Vec<(&'static str, Value)> {
             "type",
             builtin(
                 "type",
-                FunctionParams::new()
+                FunctionParameters::new()
                     .required("value", Type::Any)
                     .returns(Type::String),
                 |_, args| Ok(args.get::<Value>("value")?.type_of().to_string().into()),
@@ -885,7 +892,7 @@ fn core_functions() -> Vec<(&'static str, Value)> {
             "env",
             builtin(
                 "env",
-                FunctionParams::new()
+                FunctionParameters::new()
                     .required("name", Type::String)
                     .optional("default", Type::String)
                     .returns(Type::String),
@@ -906,7 +913,7 @@ fn core_functions() -> Vec<(&'static str, Value)> {
             "has_env",
             builtin(
                 "has_env",
-                FunctionParams::new()
+                FunctionParameters::new()
                     .required("name", Type::String)
                     .returns(Type::Bool),
                 |_, args| Ok(Value::Bool(std::env::var_os(args.get::<String>("name")?).is_some())),
@@ -916,7 +923,7 @@ fn core_functions() -> Vec<(&'static str, Value)> {
             "current_time_millis",
             builtin(
                 "current_time_millis",
-                FunctionParams::new().returns(Type::Int),
+                FunctionParameters::new().returns(Type::Int),
                 |_, _| {
                     let millis = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -930,7 +937,7 @@ fn core_functions() -> Vec<(&'static str, Value)> {
             "list",
             builtin(
                 "list",
-                FunctionParams::new()
+                FunctionParameters::new()
                     .variadic("items", Type::Any)
                     .returns(Type::list(Type::Any)),
                 |_, args| Ok(Value::List(args.rest()?)),
@@ -1046,7 +1053,7 @@ mod tests {
 
     /// f(a: String, b?: Bool, c: String = "c", rest: String...) -> String
     fn with_echo() -> Runtime {
-        fn echo(_: &BuildScriptContext, args: &Args) -> Result<Value, String> {
+        fn echo(_: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
             let a: String = args.get("a")?;
             let b: Option<bool> = args.get("b")?;
             let c: String = args.get("c")?;
@@ -1055,7 +1062,7 @@ mod tests {
             return Ok(format!("a={a} b={b:?} c={c} rest={rest:?}").into());
         }
 
-        let signature = FunctionParams::new()
+        let signature = FunctionParameters::new()
             .required("a", Type::String)
             .optional("b", Type::Bool)
             .with_default("c", Type::String, "c")
@@ -1166,7 +1173,7 @@ mod tests {
     #[test]
     fn builtins_must_return_their_declared_type() {
         let mut runtime = Runtime::new(".");
-        let signature = FunctionParams::new().returns(Type::String);
+        let signature = FunctionParameters::new().returns(Type::String);
         runtime.define(
             "bad",
             builtin("bad", signature, |_, _| Ok(Value::Bool(true))),
@@ -1207,14 +1214,14 @@ mod tests {
         // function types compare by shape, parameter names do not matter
         let shape = |name: &str| {
             Type::Function(Arc::new(
-                FunctionParams::new()
+                FunctionParameters::new()
                     .required(name, Type::String)
                     .returns(Type::Unit),
             ))
         };
 
         let optional = Type::Function(Arc::new(
-            FunctionParams::new()
+            FunctionParameters::new()
                 .optional("x", Type::String)
                 .returns(Type::Unit),
         ));
@@ -1526,7 +1533,7 @@ mod tests {
         static MOST: AtomicUsize = AtomicUsize::new(0);
         static FINISHED: Mutex<Vec<String>> = Mutex::new(vec![]);
 
-        fn slow(_: &BuildScriptContext, args: &Args) -> Result<Value, String> {
+        fn slow(_: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
             let name: String = args.get("name")?;
 
             for dependency in args.modules() {
@@ -1556,7 +1563,7 @@ mod tests {
         }
 
         let runtime_with_slow = || {
-            let signature = FunctionParams::new()
+            let signature = FunctionParameters::new()
                 .required("name", Type::String)
                 .with_default("dependencies", Type::list(Type::Module), Value::List(vec![]))
                 .returns(Type::Module);
@@ -1584,7 +1591,7 @@ mod tests {
 
     #[test]
     fn built_modules_are_remembered_for_run() {
-        fn library(_: &BuildScriptContext, args: &Args) -> Result<Value, String> {
+        fn library(_: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
             let name: String = args.get("name")?;
             return Ok(Value::from(Arc::new(BuiltModule {
                 name: name.clone(),
@@ -1598,7 +1605,7 @@ mod tests {
 
         let mut runtime = Runtime::new(".");
 
-        let signature = FunctionParams::new()
+        let signature = FunctionParameters::new()
             .required("name", Type::String)
             .returns(Type::Module);
 

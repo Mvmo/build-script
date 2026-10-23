@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::common::system;
-use crate::language::runtime::{FunctionParams, Type, Value, builtin};
+use crate::language::runtime::{FunctionParameters, Type, Value, builtin};
 
 pub use metadata::refresh;
 pub use pom::license_report;
@@ -69,7 +69,7 @@ type PomKey = (String, String, String);
 
 /// The repositories of Gradle as maven_central(), maven_local(), google() and maven(url), and platform(bom)
 pub fn builtins() -> Vec<(&'static str, Value)> {
-    let repository = || FunctionParams::new().returns(Type::String);
+    let repository = || FunctionParameters::new().returns(Type::String);
     return vec![
         (
             "maven_central",
@@ -92,7 +92,7 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
             "maven",
             builtin(
                 "maven",
-                FunctionParams::new()
+                FunctionParameters::new()
                     .required("url", Type::String)
                     .optional("username_env", Type::String)
                     .optional("password_env", Type::String)
@@ -120,7 +120,7 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
             "platform",
             builtin(
                 "platform",
-                FunctionParams::new()
+                FunctionParameters::new()
                     .required("bom", Type::String)
                     .returns(Type::String),
                 |_, args| {

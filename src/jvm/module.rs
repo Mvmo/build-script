@@ -6,7 +6,8 @@ use std::sync::Arc;
 use crate::common::system;
 use crate::common::up_to_date::InputFingerprint;
 use crate::language::runtime::{
-    Args, BuildScriptContext, BuiltModule, FunctionParams, ModuleOutput, TestSuite, Type, Value,
+    Arguments, BuildScriptContext, BuiltModule, FunctionParameters, ModuleOutput, TestSuite, Type,
+    Value,
 };
 
 use super::android::AndroidResources;
@@ -177,10 +178,10 @@ pub fn source_set_dirs(source_sets: &[&str], kinds: &[&str]) -> Value {
 /// of Kotlin only with its sources. Sources and resources come from
 /// `source_sets`, later ones lie over earlier ones.
 pub fn module_params(
-    params: FunctionParams,
+    params: FunctionParameters,
     source_sets: &[&str],
     sources: Sources,
-) -> FunctionParams {
+) -> FunctionParameters {
     let strings = || Type::list(Type::String);
     let none = || Value::string_list(&[]);
     let kotlin = sources == Sources::KotlinAndJava;
@@ -249,7 +250,7 @@ pub fn source_kinds(sources: Sources) -> &'static [&'static str] {
 }
 
 /// The `directory` argument below the project, which has to exist
-pub fn module_directory(context: &BuildScriptContext, args: &Args) -> Result<PathBuf, String> {
+pub fn module_directory(context: &BuildScriptContext, args: &Arguments) -> Result<PathBuf, String> {
     let directory = context.project_dir.join(args.get::<String>("directory")?);
 
     if !directory.is_dir() {
@@ -344,7 +345,7 @@ pub fn create_jar(
 impl ModuleBuildInputs {
     pub fn read(
         context: &BuildScriptContext,
-        args: &Args,
+        args: &Arguments,
         sources: Sources,
     ) -> Result<Self, String> {
         let kotlin = sources == Sources::KotlinAndJava;
@@ -564,7 +565,7 @@ impl ModuleBuildInputs {
     pub fn input_fingerprint(
         &self,
         name: &str,
-        args: &Args,
+        args: &Arguments,
         extra_inputs: &[PathBuf],
     ) -> Result<InputFingerprint, String> {
         let mut fingerprint =
@@ -656,7 +657,7 @@ impl ModuleBuildInputs {
 impl Dependencies {
     /// The list argument `name`. Kotlin's own libraries may leave out the
     /// version, like kotlin("test") in Gradle: they get the compiler's.
-    pub fn read(args: &Args, name: &str, kotlin_version: &str) -> Result<Self, String> {
+    pub fn read(args: &Arguments, name: &str, kotlin_version: &str) -> Result<Self, String> {
         let mut dependencies = Dependencies::default();
 
         for value in args.get::<Vec<Value>>(name)? {

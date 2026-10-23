@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use crate::common::system;
 use crate::common::up_to_date::InputFingerprint;
-use crate::language::runtime::{Args, BuildScriptContext, FunctionParams, Type, Value, builtin};
+use crate::language::runtime::{
+    Arguments, BuildScriptContext, FunctionParameters, Type, Value, builtin,
+};
 
 use super::jdk::{self, Jdk};
 use super::maven::{self, DependencyResolver, MavenCoordinate, TargetPlatform};
@@ -18,7 +20,7 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
         "generate_sources",
         builtin(
             "generate_sources",
-            FunctionParams::new()
+            FunctionParameters::new()
                 .required("name", Type::String)
                 .required("tool", Type::list(Type::String))
                 .required("repositories", Type::list(Type::String))
@@ -40,7 +42,7 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
 
 /// Runs a tool that writes sources into build/generated/sources/<name> of the directory and returns that directory, for generated_sources of a module.
 /// The tool runs in the directory, inputs and args are relative to it, tool_sources to the build script.
-fn generate_sources(context: &BuildScriptContext, args: &Args) -> Result<Value, String> {
+fn generate_sources(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let name: String = args.get("name")?;
     let main_class: String = args.get("main_class")?;
     let directory = module_directory(context, args)?;

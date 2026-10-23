@@ -10,7 +10,7 @@ use std::process::Command;
 use serde_json::Value as Json;
 
 use crate::common::system;
-use crate::language::runtime::Args;
+use crate::language::runtime::Arguments;
 
 use super::maven::{self, DependencyResolver, MavenCoordinate};
 use super::module::{Dependencies, ModuleBuildInputs};
@@ -83,7 +83,7 @@ impl SymbolProcessors {
         };
     }
 
-    pub fn read(args: &Args, name: &str, kotlin_version: &str) -> Result<Self, String> {
+    pub fn read(args: &Arguments, name: &str, kotlin_version: &str) -> Result<Self, String> {
         return Ok(SymbolProcessors {
             processors: Dependencies::read(args, name, kotlin_version)?,
             options: args.get("ksp_options")?,
@@ -145,14 +145,14 @@ impl SymbolProcessing<'_> {
             &self.resolved.analyzer_kotlin_version,
         );
 
-        let snapshot = KspSnapshot {
+        let snapshot = SymbolProcessingSnapshot {
             configuration: self.configuration_hash(&language_version)?,
             sources: source_hashes(self.source_dirs)?,
         };
 
         let snapshot_file = self.caches_dir.join(SNAPSHOT_FILE_NAME);
 
-        let changes = KspSnapshot::read(&snapshot_file)
+        let changes = SymbolProcessingSnapshot::read(&snapshot_file)
             .filter(|previous| {
                 previous.configuration == snapshot.configuration && self.output_dir.is_dir()
             })
@@ -355,7 +355,7 @@ impl SymbolProcessing<'_> {
 
 /// The sources one run of KSP saw
 #[derive(Debug, PartialEq)]
-struct KspSnapshot {
+struct SymbolProcessingSnapshot {
     configuration: u64,
     sources: BTreeMap<PathBuf, u64>,
 }
@@ -372,9 +372,9 @@ impl SourceChanges {
     }
 }
 
-impl KspSnapshot {
+impl SymbolProcessingSnapshot {
     /// Sources that are new or changed, and sources that are gone
-    fn changes_since(&self, previous: &KspSnapshot) -> SourceChanges {
+    fn changes_since(&self, previous: &SymbolProcessingSnapshot) -> SourceChanges {
         let modified = self
             .sources
             .iter()
@@ -393,7 +393,7 @@ impl KspSnapshot {
     }
 
     /// First line the configuration, then a hash and a path per line
-    fn read(file: &Path) -> Option<KspSnapshot> {
+    fn read(file: &Path) -> Option<SymbolProcessingSnapshot> {
         let content = fs::read_to_string(file).ok()?;
         let mut lines = content.lines();
         let configuration = lines.next()?.parse().ok()?;
@@ -404,7 +404,7 @@ impl KspSnapshot {
             sources.insert(PathBuf::from(path), hash.parse().ok()?);
         }
 
-        return Some(KspSnapshot {
+        return Some(SymbolProcessingSnapshot {
             configuration,
             sources,
         });
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn snapshots_tell_which_sources_changed() {
-        let snapshot = |sources: &[(&str, u64)]| KspSnapshot {
+        let snapshot = |sources: &[(&str, u64)]| SymbolProcessingSnapshot {
             configuration: 7,
             sources: sources
                 .iter()
@@ -528,7 +528,7 @@ mod tests {
             std::env::temp_dir().join(format!("build-script-ksp-snapshot-{}", std::process::id()));
 
         current.write(&file).unwrap();
-        assert_eq!(KspSnapshot::read(&file), Some(current));
+        assert_eq!(SymbolProcessingSnapshot::read(&file), Some(current));
         fs::remove_file(&file).unwrap();
     }
 

@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::common::system;
 use crate::jvm::{self, install::InstallTarget};
 use crate::language::parser::{Parser, Script};
-use crate::language::runtime::{FromValue, ParamDefault, Runtime};
+use crate::language::runtime::{FromValue, ParameterDefault, Runtime};
 
 use super::script::{self, DependencyChange, ModuleCall};
 
@@ -168,7 +168,7 @@ fn argument_value<T: FromValue>(
             .iter()
             .find(|param| param.name == parameter)
             .and_then(|param| match &param.default {
-                ParamDefault::Value(value) => Some(value.clone()),
+                ParameterDefault::Value(value) => Some(value.clone()),
                 _ => None,
             })
     };

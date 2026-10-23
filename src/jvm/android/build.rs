@@ -13,7 +13,7 @@ use crate::jvm::maven::{DependencyResolver, MavenCoordinate, TargetPlatform};
 use crate::jvm::module::{
     self, Compilation, ModuleBuildInputs, ResolvedDependencies, Sources, create_jar,
 };
-use crate::language::runtime::{Args, BuildScriptContext, BuiltModule};
+use crate::language::runtime::{Arguments, BuildScriptContext, BuiltModule};
 
 use super::generated::{
     SymbolTable, binding_class, build_config_java_fields, layouts_by_name, view_binding_source,
@@ -88,7 +88,7 @@ pub struct DesugaredLibrary {
 /// consumers of a library need as well
 pub fn read_android_inputs(
     context: &BuildScriptContext,
-    args: &Args,
+    args: &Arguments,
 ) -> Result<ModuleBuildInputs, String> {
     let mut inputs = ModuleBuildInputs::read(context, args, Sources::KotlinAndJava)?;
 
@@ -106,7 +106,7 @@ pub fn read_android_inputs(
 /// The module's directories of the list argument `name` that contain files, lowest priority first
 pub fn existing_dirs(
     inputs: &ModuleBuildInputs,
-    args: &Args,
+    args: &Arguments,
     name: &str,
 ) -> Result<Vec<PathBuf>, String> {
     let dirs: Vec<String> = args.get(name)?;
@@ -120,7 +120,7 @@ pub fn existing_dirs(
 /// The module's jniLibs and, with a CMakeLists.txt, the libraries built from it
 pub fn native_library_dirs(
     inputs: &ModuleBuildInputs,
-    args: &Args,
+    args: &Arguments,
 ) -> Result<Vec<PathBuf>, String> {
     let mut dirs = source_set_dirs_with_files(inputs, "jniLibs");
 
@@ -135,7 +135,7 @@ pub fn native_library_dirs(
 /// resources, AIDL, manifests, assets, native libraries, Java resources
 pub fn android_input_paths(
     inputs: &ModuleBuildInputs,
-    args: &Args,
+    args: &Arguments,
 ) -> Result<Vec<PathBuf>, String> {
     let mut paths: Vec<PathBuf> = ["res_dirs", "aidl_dirs", "asset_dirs"]
         .iter()
@@ -220,14 +220,17 @@ pub fn merge_java_resources(jars: &[PathBuf], output: &Path, scratch: &Path) -> 
 }
 
 impl AndroidBuild {
-    pub fn prepare(inputs: ModuleBuildInputs, args: &Args) -> Result<Self, String> {
+    pub fn prepare(inputs: ModuleBuildInputs, args: &Arguments) -> Result<Self, String> {
         let build_dir = inputs.directory.join("build");
         return Self::prepare_variant(inputs, args, "debug", build_dir);
     }
 
     /// The module with its instrumented tests, built apart from the module: the
     /// resources and assets of src/androidTest lie over those of the module
-    pub fn prepare_android_tests(inputs: ModuleBuildInputs, args: &Args) -> Result<Self, String> {
+    pub fn prepare_android_tests(
+        inputs: ModuleBuildInputs,
+        args: &Arguments,
+    ) -> Result<Self, String> {
         let build_dir = inputs.directory.join("build/androidTest");
         let mut build = Self::prepare_variant(inputs, args, "debugAndroidTest", build_dir)?;
         let test_dir = build.inputs.directory.join("src/androidTest");
@@ -247,7 +250,7 @@ impl AndroidBuild {
 
     fn prepare_variant(
         inputs: ModuleBuildInputs,
-        args: &Args,
+        args: &Arguments,
         variant: &'static str,
         build_dir: PathBuf,
     ) -> Result<Self, String> {
