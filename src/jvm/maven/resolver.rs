@@ -991,9 +991,17 @@ impl DependencyResolver {
                         return Ok(Some(file));
                     }
                 }
-                MavenRepository::Remote(url) => {
+                MavenRepository::Remote { url, .. } => {
                     let file = self.cache_dir.join(path);
-                    if file.is_file() || system::download(&format!("{url}/{path}"), &file, false)? {
+
+                    if file.is_file() {
+                        return Ok(Some(file));
+                    }
+
+                    let credentials = repository.credentials()?;
+                    let url = format!("{url}/{path}");
+
+                    if system::download(&url, &file, false, credentials.as_ref())? {
                         return Ok(Some(file));
                     }
                 }
@@ -1475,9 +1483,10 @@ mod tests {
     #[test]
     #[ignore]
     fn resolves_kotlin_compiler_from_maven_central() {
-        let repositories = vec![maven::MavenRepository::Remote(
-            maven::MAVEN_CENTRAL.to_string(),
-        )];
+        let repositories = vec![maven::MavenRepository::Remote {
+            url: maven::MAVEN_CENTRAL.to_string(),
+            credentials: None,
+        }];
 
         let mut resolver = maven::DependencyResolver::new(repositories, maven::TargetPlatform::Jvm);
 

@@ -225,8 +225,20 @@ pub fn run(command: &mut Command, what: &str) -> Result<(), String> {
     return Ok(());
 }
 
+/// For servers that want a user name and password. Deliberately no Debug, so
+/// the password cannot end up in a log.
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
 /// False if the server does not have the file
-pub fn download(url: &str, target: &Path, show_progress: bool) -> Result<bool, String> {
+pub fn download(
+    url: &str,
+    target: &Path,
+    show_progress: bool,
+    credentials: Option<&Credentials>,
+) -> Result<bool, String> {
     create_parent_dir(target)?;
 
     // renamed once complete, so no partial files are left behind
@@ -243,17 +255,48 @@ pub fn download(url: &str, target: &Path, show_progress: bool) -> Result<bool, S
             "--output",
         ])
         .arg(&partial)
-        .arg(url);
+        .arg(url)
+        .stdout(Stdio::piped());
 
     if show_progress {
         command.arg("--progress-bar").stderr(Stdio::inherit());
     } else {
-        command.arg("--silent");
+        command.arg("--silent").stderr(Stdio::piped());
     }
 
-    let output = command
-        .output()
+    // on stdin as a config file, arguments are visible to every process on the machine
+    match credentials {
+        Some(_) => command.args(["--config", "-"]).stdin(Stdio::piped()),
+        None => command.stdin(Stdio::null()),
+    };
+
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("could not start curl: {error}"))?;
+
+    if let (Some(credentials), Some(mut stdin)) = (credentials, child.stdin.take()) {
+        let quoted = |value: &str| {
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+        };
+
+        let config = format!(
+            "user = \"{}:{}\"\n",
+            quoted(&credentials.username),
+            quoted(&credentials.password)
+        );
+
+        stdin
+            .write_all(config.as_bytes())
+            .map_err(|error| format!("could not pass the credentials to curl: {error}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("curl failed: {error}"))?;
 
     let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
@@ -274,8 +317,14 @@ pub fn download(url: &str, target: &Path, show_progress: bool) -> Result<bool, S
         ));
     }
 
-    match status.as_str() {
-        "404" | "410" => return Ok(false),
+    match (status.as_str(), credentials) {
+        ("404" | "410", _) => return Ok(false),
+        ("401" | "403", None) => return Err(format!("{url} needs credentials (HTTP {status})")),
+        ("401" | "403", Some(_)) => {
+            return Err(format!(
+                "{url} did not accept the credentials (HTTP {status})"
+            ));
+        }
         _ => return Err(format!("download of {url} failed: HTTP {status}")),
     }
 }
@@ -288,7 +337,7 @@ pub fn download_verified(
     show_progress: bool,
     checksum: Option<(u32, &str)>,
 ) -> Result<bool, String> {
-    if !download(url, target, show_progress)? {
+    if !download(url, target, show_progress, None)? {
         return Ok(false);
     }
 
