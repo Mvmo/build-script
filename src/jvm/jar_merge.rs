@@ -256,3 +256,129 @@ fn relocated_class(name: &str, relocations: &[(String, String)]) -> String {
     return name.to_string();
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A jar of `files` (path and content), made with zip like any other archive
+    fn jar(directory: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let content_dir = directory.join(format!("{name}-content"));
+
+        for (path, content) in files {
+            system::write_file(&content_dir.join(path), content).unwrap();
+        }
+
+        let jar = directory.join(format!("{name}.jar"));
+        let status = Command::new("zip")
+            .args(["-q", "-r"])
+            .arg(&jar)
+            .arg(".")
+            .current_dir(&content_dir)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+
+        return jar;
+    }
+
+    #[test]
+    fn the_first_jar_wins_services_are_concatenated_signatures_left_out() {
+        let directory =
+            std::env::temp_dir().join(format!("build-script-merge-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&directory);
+
+        let first = jar(
+            &directory,
+            "first",
+            &[
+                ("com/example/Shared.class", "first"),
+                ("META-INF/services/com.example.Service", "com.example.First"),
+                ("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n"),
+                ("META-INF/FIRST.SF", "signature"),
+                ("module-info.class", "module"),
+            ],
+        );
+
+        let second = jar(
+            &directory,
+            "second",
+            &[
+                ("com/example/Shared.class", "second"),
+                ("META-INF/services/com.example.Service", "com.example.Second\n"),
+                ("META-INF/versions/17/com/example/Newer.class", "newer"),
+                ("META-INF/versions/17/module-info.class", "module"),
+            ],
+        );
+
+        let output = directory.join("merged");
+        let differing = merge_jars(
+            &[first.clone(), second.clone()],
+            JarContents::ClassesAndResources,
+            &output,
+            &directory.join("scratch"),
+        )
+        .unwrap();
+
+        let read = |path: &str| system::read_file(&output.join(path)).unwrap();
+
+        assert_eq!(read("com/example/Shared.class"), "first");
+        assert_eq!(differing, 1);
+        assert_eq!(
+            read("META-INF/services/com.example.Service"),
+            "com.example.First\ncom.example.Second\n"
+        );
+        assert_eq!(read("META-INF/versions/17/com/example/Newer.class"), "newer");
+
+        for left_out in [
+            "META-INF/MANIFEST.MF",
+            "META-INF/FIRST.SF",
+            "module-info.class",
+            "META-INF/versions/17/module-info.class",
+        ] {
+            assert!(!output.join(left_out).exists(), "{left_out}");
+        }
+
+        // an apk gets the resources only
+        merge_jars(
+            &[first, second],
+            JarContents::JavaResources,
+            &output,
+            &directory.join("scratch"),
+        )
+        .unwrap();
+
+        assert!(!output.join("com/example/Shared.class").exists());
+        assert!(!output.join("META-INF/versions").exists());
+        assert!(output.join("META-INF/services/com.example.Service").is_file());
+
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn service_files_are_relocated_by_name_and_content() {
+        let contents =
+            std::env::temp_dir().join(format!("build-script-services-{}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&contents);
+
+        system::write_file(
+            &contents.join("META-INF/services/org.bstats.Service"),
+            "org.bstats.charts.Chart\norg.bstatsother.Kept\n",
+        )
+        .unwrap();
+
+        let relocations = [("org.bstats".to_string(), "dev.mvmo.libs.bstats".to_string())];
+        relocate_service_files(&contents, &relocations).unwrap();
+
+        assert_eq!(
+            system::read_file(&contents.join("META-INF/services/dev.mvmo.libs.bstats.Service"))
+                .unwrap(),
+            "dev.mvmo.libs.bstats.charts.Chart\norg.bstatsother.Kept\n"
+        );
+        assert!(!contents.join("META-INF/services/org.bstats.Service").exists());
+
+        fs::remove_dir_all(&contents).unwrap();
+    }
+}
