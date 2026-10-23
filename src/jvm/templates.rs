@@ -1,4 +1,5 @@
-// Templates of JVM modules for `build-script new` and `build-script add`: Kotlin and Java apps and libraries, Android apps and libraries
+// Templates of JVM modules for `build-script new` and `build-script add`: Kotlin and Java apps and libraries,
+// Android apps and libraries with Jetpack Compose
 use crate::project::{ModuleTemplate, NewModule};
 
 pub const MODULE_KINDS: &[&str] = &[
@@ -95,6 +96,15 @@ const KEYWORDS: &[&str] = &[
 const MAVEN_CENTRAL: &[&str] = &["maven_central()"];
 const GOOGLE_AND_MAVEN_CENTRAL: &[&str] = &["google()", "maven_central()"];
 
+/// The versions of the Compose libraries that go together
+const COMPOSE_BOM: &str = r#"platform("androidx.compose:compose-bom:2026.09.00")"#;
+/// setContent for the activity
+const ACTIVITY_COMPOSE: &str = r#""androidx.activity:activity-compose:1.13.0""#;
+const COMPOSE_LIBRARIES: &[&str] = &[
+    r#""androidx.compose.material3:material3""#,
+    r#""androidx.compose.ui:ui""#,
+];
+
 /// Like the Java naming conventions name packages after a domain: reversed,
 /// characters other than letters and digits become underscores, a keyword gets
 /// one appended and a label that starts with a digit one prefixed: mvmo.dev -> dev.mvmo
@@ -162,15 +172,7 @@ pub fn module_template(kind: &str, module: &NewModule) -> Option<ModuleTemplate>
     let package = &module.package;
     let name = &module.name;
 
-    let dependencies = format!(
-        "list({})",
-        module
-            .dependencies
-            .iter()
-            .map(|(variable, _)| variable.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    let dependencies = dependency_list(module, &[]);
 
     let template = match kind {
         "kotlin-app" => {
@@ -241,28 +243,29 @@ pub fn module_template(kind: &str, module: &NewModule) -> Option<ModuleTemplate>
             files: vec![
                 (
                     "src/main/AndroidManifest.xml".to_string(),
-                    APP_MANIFEST.to_string(),
-                ),
-                (
-                    "src/main/res/values/strings.xml".to_string(),
-                    format!(
-                        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n    <string name=\"app_name\">{name}</string>\n    <string name=\"greeting\">Hello from {name}</string>\n</resources>\n",
-                    ),
-                ),
-                (
-                    "src/main/res/layout/activity_main.xml".to_string(),
-                    MAIN_LAYOUT.to_string(),
+                    APP_MANIFEST.replace("{name}", name),
                 ),
                 (
                     format!("src/main/kotlin/{package_dir}/MainActivity.kt"),
-                    format!(
-                        "package {package}\n\nimport android.app.Activity\nimport android.os.Bundle\n\nclass MainActivity : Activity() {{\n    override fun onCreate(savedInstanceState: Bundle?) {{\n        super.onCreate(savedInstanceState)\n        setContentView(R.layout.activity_main)\n    }}\n}}\n",
-                    ),
+                    MAIN_ACTIVITY
+                        .replace("{package}", package)
+                        .replace("{name}", name),
+                ),
+                (
+                    format!("src/main/kotlin/{package_dir}/ui/theme/Theme.kt"),
+                    THEME.replace("{package}", package),
                 ),
             ],
             function: "build_android",
-            positional: vec![quoted(name), quoted(package), dependencies],
-            named: vec![],
+            positional: vec![
+                quoted(name),
+                quoted(package),
+                dependency_list(
+                    module,
+                    &[&[COMPOSE_BOM, ACTIVITY_COMPOSE], COMPOSE_LIBRARIES].concat(),
+                ),
+            ],
+            named: vec![("plugins", r#"list("compose")"#.to_string())],
         },
         "android-library" => ModuleTemplate {
             platform: "android",
@@ -270,13 +273,17 @@ pub fn module_template(kind: &str, module: &NewModule) -> Option<ModuleTemplate>
             is_app: false,
             files: vec![(
                 format!("src/main/kotlin/{package_dir}/Greeting.kt"),
-                format!(
-                    "package {package}\n\nfun greeting(name: String): String = \"Hello, $name, from {name}\"\n"
-                ),
+                LIBRARY_GREETING
+                    .replace("{package}", package)
+                    .replace("{name}", name),
             )],
             function: "build_android_library",
-            positional: vec![quoted(name), quoted(package), dependencies],
-            named: vec![],
+            positional: vec![
+                quoted(name),
+                quoted(package),
+                dependency_list(module, &[&[COMPOSE_BOM], COMPOSE_LIBRARIES].concat()),
+            ],
+            named: vec![("plugins", r#"list("compose")"#.to_string())],
         },
         _ => return None,
     };
@@ -284,9 +291,32 @@ pub fn module_template(kind: &str, module: &NewModule) -> Option<ModuleTemplate>
     return Some(template);
 }
 
+/// list(...) of the modules it depends on and of `libraries`, which are written
+/// as in the script, one a line when there are libraries
+fn dependency_list(module: &NewModule, libraries: &[&str]) -> String {
+    let entries: Vec<&str> = module
+        .dependencies
+        .iter()
+        .map(|(variable, _)| variable.as_str())
+        .chain(libraries.iter().copied())
+        .collect();
+
+    if libraries.is_empty() {
+        return format!("list({})", entries.join(", "));
+    }
+
+    let lines: String = entries
+        .iter()
+        .map(|entry| format!("        {entry},\n"))
+        .collect();
+
+    return format!("list(\n{lines}    )");
+}
+
+/// Compose draws everything, the theme only keeps the window free of an action bar
 const APP_MANIFEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:label="@string/app_name" android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+    <application android:label="{name}" android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -297,18 +327,84 @@ const APP_MANIFEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 </manifest>
 "#;
 
-const MAIN_LAYOUT: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent">
+const MAIN_ACTIVITY: &str = r#"package {package}
 
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="center"
-        android:text="@string/greeting"
-        android:textSize="24sp" />
-</FrameLayout>
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import {package}.ui.theme.AppTheme
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            AppTheme {
+                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+                    Greeting("{name}", Modifier.padding(innerPadding))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun Greeting(name: String, modifier: Modifier = Modifier) {
+    Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text("Hello from $name", style = MaterialTheme.typography.headlineMedium)
+    }
+}
+"#;
+
+const THEME: &str = r#"package {package}.ui.theme
+
+import android.os.Build
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.platform.LocalContext
+
+/** The colors of the wallpaper from Android 12 on, Material's own before, dark when the system is */
+@Composable
+fun AppTheme(darkTheme: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
+    val colorScheme = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            val context = LocalContext.current
+            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+        }
+        darkTheme -> darkColorScheme()
+        else -> lightColorScheme()
+    }
+
+    MaterialTheme(colorScheme = colorScheme, content = content)
+}
+"#;
+
+const LIBRARY_GREETING: &str = r#"package {package}
+
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+
+@Composable
+fun Greeting(name: String, modifier: Modifier = Modifier) {
+    Text("Hello, $name, from {name}", modifier, style = MaterialTheme.typography.bodyLarge)
+}
 "#;
 
 fn quoted(value: &str) -> String {

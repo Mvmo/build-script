@@ -590,11 +590,18 @@ mod tests {
                 .contains("not a package name")
         );
         let script = system::read_file(&root.join("hello-app/project.build")).unwrap();
-        assert!(script.contains("hello_app = build_android(\n    \"hello-app\",\n    \"org.acme.hello\",\n    list(),\n    repositories,\n)\n"), "{script}");
-        assert!(
-            root.join("hello-app/src/main/kotlin/org/acme/hello/MainActivity.kt")
-                .is_file()
-        );
+        // Compose, without layouts and other resources
+        assert!(script.contains("hello_app = build_android(\n    \"hello-app\",\n    \"org.acme.hello\",\n    list(\n        platform(\"androidx.compose:compose-bom:"), "{script}");
+        assert!(script.contains("        \"androidx.activity:activity-compose:"), "{script}");
+        assert!(script.ends_with("    ),\n    repositories,\n    plugins = list(\"compose\"),\n)\n"), "{script}");
+        let activity = system::read_file(
+            &root.join("hello-app/src/main/kotlin/org/acme/hello/MainActivity.kt"),
+        )
+        .unwrap();
+        assert!(activity.contains("import org.acme.hello.ui.theme.AppTheme"), "{activity}");
+        assert!(activity.contains("Greeting(\"hello-app\", Modifier.padding(innerPadding))"), "{activity}");
+        assert!(root.join("hello-app/src/main/kotlin/org/acme/hello/ui/theme/Theme.kt").is_file());
+        assert!(!root.join("hello-app/src/main/res").exists());
         fs::remove_dir_all(&root).unwrap();
     }
 }
