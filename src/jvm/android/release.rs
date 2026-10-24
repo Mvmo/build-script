@@ -297,3 +297,30 @@ pub fn shrink_with_r8(
     return Ok(library_keep_rules);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classes_of_service_files_keep_their_names() {
+        let name = format!("build-script-services-rules-{}", std::process::id());
+        let directory = std::env::temp_dir().join(name);
+
+        let _ = std::fs::remove_dir_all(&directory);
+
+        system::write_file(
+            &directory.join("META-INF/services/com.example.Plugin"),
+            "# providers\ncom.example.First\ncom.example.Second # the other one\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            keep_rules_for_services(&directory).unwrap(),
+            "-keepnames class com.example.Plugin\n\
+             -keep class com.example.First { <init>(); }\n\
+             -keep class com.example.Second { <init>(); }\n"
+        );
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+}
