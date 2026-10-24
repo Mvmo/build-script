@@ -43,6 +43,9 @@ const DEFAULT_RULES: &str = "\
     @androidx.annotation.Keep <init>(...);
 }
 -dontwarn android.support.**
+# window extensions and sidecar come with the device, like the platform
+-dontwarn androidx.window.extensions.**
+-dontwarn androidx.window.sidecar.**
 ";
 
 /// The key of release apks, from keystore, key_alias, keystore_password_env and key_password_env
