@@ -903,10 +903,15 @@ impl AndroidBuild {
 
         command.args(inputs);
 
+        return self.run_dex_tool(&mut command, "d8");
+    }
+
+    /// d8 or R8, with the notes split_d8_noise hides only counted
+    pub fn run_dex_tool(&self, command: &mut Command, tool: &str) -> Result<(), String> {
         let result = command
             .stdin(Stdio::null())
             .output()
-            .map_err(|error| format!("could not start d8: {error}"))?;
+            .map_err(|error| format!("could not start {tool}: {error}"))?;
 
         let text = format!(
             "{}{}",
@@ -916,7 +921,7 @@ impl AndroidBuild {
 
         if !result.status.success() {
             eprint!("{text}");
-            return Err(format!("d8 failed ({})", result.status));
+            return Err(format!("{tool} failed ({})", result.status));
         }
 
         let (shown, hidden) = split_d8_noise(&text);
@@ -926,12 +931,10 @@ impl AndroidBuild {
         }
 
         if hidden > 0 {
-            system::log(
-                &self.inputs.name,
-                &format!(
-                    "d8: hid {hidden} lines of notes about libraries (Kotlin metadata newer than this d8 knows, stripped debug info)",
-                ),
+            let message = format!(
+                "{tool}: hid {hidden} lines of notes, most about Kotlin metadata newer than this {tool} knows"
             );
+            system::log(&self.inputs.name, &message);
         }
 
         return Ok(());
@@ -1602,7 +1605,7 @@ fn source_set_dirs_with_files(
 
 /// Output of d8 and R8 worth showing, and how many lines of noise it hid: they warn
 /// about every class with Kotlin metadata newer than they know, harmless for dexing
-pub fn split_d8_noise(text: &str) -> (Vec<&str>, usize) {
+fn split_d8_noise(text: &str) -> (Vec<&str>, usize) {
     // a diagnostic starts with Warning/Info/Error and ends at the next one or an empty line
     let mut blocks: Vec<Vec<&str>> = vec![vec![]];
 

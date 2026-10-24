@@ -1,12 +1,11 @@
 // Release builds: R8 shrinks, optimizes and renames the code with the ProGuard rules of build-script,
 // of aapt2, of the libraries and of the app, then dexes it. The apk is signed with the key of the script.
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use crate::common::system;
 use crate::language::runtime::Arguments;
 
-use super::build::{AndroidBuild, DesugaredLibrary, split_d8_noise, unique};
+use super::build::{AndroidBuild, DesugaredLibrary, unique};
 
 /// What every app needs kept, like proguard-android-optimize.txt of the Android Gradle plugin
 const DEFAULT_RULES: &str = "\
@@ -262,35 +261,7 @@ pub fn shrink_with_r8(
     }
 
     command.args(unique(own_jars.iter().chain(&build.jars)));
-
-    let result = command
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("could not start R8: {error}"))?;
-
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
-
-    if !result.status.success() {
-        eprint!("{text}");
-        return Err(format!("R8 failed ({})", result.status));
-    }
-
-    let (shown, hidden) = split_d8_noise(&text);
-
-    for line in shown {
-        eprintln!("{line}");
-    }
-
-    if hidden > 0 {
-        let message = format!(
-            "R8: hid {hidden} lines of notes (Kotlin metadata newer than this R8 knows, rules that match nothing)"
-        );
-        system::log(&build.inputs.name, &message);
-    }
+    build.run_dex_tool(&mut command, "R8")?;
 
     system::log(
         &build.inputs.name,
