@@ -79,6 +79,9 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
             .optional("core_library_desugaring", Type::String)
             // asset name of a JSON report of the libraries' licenses
             .optional("license_report", Type::String)
+            // only for build-script build --release: R8 with these rules
+            .with_default("minify", Type::Bool, true)
+            .with_default("proguard_files", Type::list(Type::String), Value::string_list(&[]))
             // the release key, its passwords from environment variables the script names
             .optional("keystore", Type::String)
             .optional("key_alias", Type::String)
@@ -171,12 +174,12 @@ fn android_parameters(parameters: FunctionParameters) -> FunctionSignature {
     .returns(Type::Module);
 }
 
-/// An apk in build/outputs/apk/<build type>/: aapt2, kotlinc against android.jar, d8,
-/// aligned and signed with the debug key or the release key
+/// An apk in build/outputs/apk/<build type>/: aapt2, kotlinc against android.jar, d8 or
+/// for release R8, aligned and signed with the debug key or the release key
 fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let inputs = read_android_inputs(context, args)?;
     let build_type = BuildType::of(context);
-    let settings = ApkSettings::of_app(args)?;
+    let settings = ApkSettings::of_app(args, &inputs.directory)?;
     let namespace: String = args.get("namespace")?;
     let build_dir = inputs.directory.join("build");
     let manifest = build_dir.join("intermediates/manifest/AndroidManifest.xml");
@@ -205,6 +208,7 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
         .join(format!("{output_name}.apk"));
 
     let mut input_paths = android_input_paths(&inputs, args, build_type)?;
+    input_paths.extend(settings.proguard_files.iter().cloned());
     input_paths.extend(release_key.iter().map(|key| key.keystore.clone()));
 
     let mut fingerprint = inputs.input_fingerprint(&inputs.name, args, &input_paths)?;
@@ -406,6 +410,9 @@ struct ApkSettings {
     license_report: Option<String>,
     /// "Type NAME value" of its BuildConfig besides DEBUG and BUILD_TYPE
     build_config: Vec<String>,
+    /// release builds: R8 or only d8, and the app's own rules for R8
+    minify: bool,
+    proguard_files: Vec<PathBuf>,
 }
 
 /// One apk of a module: what it is built as, from which manifests, to where
@@ -422,7 +429,7 @@ struct Apk<'a> {
 }
 
 impl ApkSettings {
-    fn of_app(args: &Arguments) -> Result<Self, String> {
+    fn of_app(args: &Arguments, module_dir: &Path) -> Result<Self, String> {
         let namespace: String = args.get("namespace")?;
 
         let application_id = args
@@ -444,6 +451,8 @@ impl ApkSettings {
             target_sdk: args.get("target_sdk")?,
             core_library_desugaring: args.get("core_library_desugaring")?,
             license_report: args.get("license_report")?,
+            minify: args.get("minify")?,
+            proguard_files: required_module_files(args, "proguard_files", module_dir)?,
         });
     }
 
@@ -457,12 +466,14 @@ impl ApkSettings {
             core_library_desugaring: None,
             license_report: None,
             build_config: vec![format!("String LIBRARY_PACKAGE_NAME {namespace}")],
+            minify: false,
+            proguard_files: vec![],
         };
     }
 }
 
 impl Apk<'_> {
-    /// Resources linked with aapt2, R and BuildConfig, Kotlin and Java, dex with d8,
+    /// Resources linked with aapt2, R and BuildConfig, Kotlin and Java, dex with d8 or R8,
     /// packaged with the Java resources and native libraries. Returns the merged manifest.
     fn build(&self, build: &AndroidBuild) -> Result<XmlElement, String> {
         let settings = self.settings;
@@ -494,6 +505,26 @@ impl Apk<'_> {
         // debug builds are debuggable, like with the Gradle plugin
         if build.build_type == BuildType::Debug {
             extra.push("--debug-mode".to_string());
+        }
+
+        let shrinks = build.build_type == BuildType::Release && settings.minify;
+        let proguard_dir = intermediates.join("proguard");
+        let aapt2_rules = proguard_dir.join("aapt2.pro");
+        let main_dex_rules = proguard_dir.join("main-dex.pro");
+        // below API 21 what starts the app has to be in the first dex file
+        let needs_main_dex = build.min_sdk < 21;
+
+        // what the manifest and the layouts name by class name has to stay
+        if shrinks {
+            system::create_dir(&proguard_dir)?;
+            extra.extend(["--proguard".to_string(), aapt2_rules.display().to_string()]);
+
+            if needs_main_dex {
+                extra.extend([
+                    "--proguard-main-dex".to_string(),
+                    main_dex_rules.display().to_string(),
+                ]);
+            }
         }
 
         if settings.application_id != build.namespace {
@@ -547,8 +578,6 @@ impl Apk<'_> {
         let generated_resources = build.compile_sources(&[generated.clone()], &classes)?;
         build.build_native_libraries()?;
 
-        system::log(&build.inputs.name, "Dexing");
-
         let own_jars = vec![
             build.jar(&classes, &intermediates.join("jars/classes.jar"))?,
             build.jar(&generated, &intermediates.join("jars/generated.jar"))?,
@@ -563,10 +592,36 @@ impl Apk<'_> {
             None => None,
         };
 
-        build.dex(&own_jars, &dex_dir, desugared.as_ref())?;
+        let mut library_keep_rules = None;
+
+        if shrinks {
+            system::log(&build.inputs.name, "Shrinking and dexing with R8");
+            let rules = release::proguard_rule_files(
+                &settings.proguard_files,
+                &aapt2_rules,
+                &proguard_dir,
+            )?;
+
+            library_keep_rules = release::shrink_with_r8(
+                build,
+                &own_jars,
+                &rules,
+                Some(main_dex_rules.as_path()).filter(|_| needs_main_dex),
+                desugared.as_ref(),
+                &dex_dir,
+            )?;
+        } else {
+            system::log(&build.inputs.name, "Dexing");
+            build.dex(&own_jars, &dex_dir, desugared.as_ref())?;
+        }
 
         if let Some(desugared) = &desugared {
-            build.dex_desugared_library(desugared, &dex_dir, &intermediates.join("desugar/dex"))?;
+            build.dex_desugared_library(
+                desugared,
+                library_keep_rules.as_deref(),
+                &dex_dir,
+                &intermediates.join("desugar/dex"),
+            )?;
         }
 
         system::log(&build.inputs.name, "Packaging");
@@ -588,8 +643,10 @@ impl Apk<'_> {
             &java_resources,
             &intermediates.join("java-resources.tmp"),
         )?;
+
         let native_libraries = intermediates.join("native-libraries");
         build.merge_native_libraries(&native_libraries)?;
+
         build.package(
             &linked,
             &dex_dir,
@@ -602,6 +659,27 @@ impl Apk<'_> {
 
         return Ok(merged_manifest);
     }
+}
+
+/// The files the parameter `name` lists, relative to the module. A missing one is an error.
+fn required_module_files(
+    args: &Arguments,
+    name: &str,
+    module_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let mut files = vec![];
+
+    for file in args.get::<Vec<String>>(name)? {
+        let file = module_dir.join(file);
+
+        if !file.is_file() {
+            return Err(format!("{name}: {} does not exist", file.display()));
+        }
+
+        files.push(file);
+    }
+
+    return Ok(files);
 }
 
 fn android_sdk(args: &Arguments) -> Result<AndroidSdk, String> {

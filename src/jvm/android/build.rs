@@ -113,7 +113,7 @@ pub struct AndroidBuild {
     /// of `jars` the classes of library modules, they change with the app
     module_jars: Vec<PathBuf>,
     /// only to compile against
-    compile_only: Vec<PathBuf>,
+    pub compile_only: Vec<PathBuf>,
     /// aars and library modules with resources, lowest priority first
     libraries: Vec<AndroidResourceLibrary>,
     /// jniLibs directories and the libraries built with CMake
@@ -125,7 +125,7 @@ pub struct AndroidBuild {
 
 /// desugar_jdk_libs: its d8 configuration and its jars
 pub struct DesugaredLibrary {
-    config: PathBuf,
+    pub config: PathBuf,
     jars: Vec<PathBuf>,
 }
 
@@ -710,13 +710,19 @@ impl AndroidBuild {
     }
 
     /// With L8, added after the app's dex files. Kept in `work_dir` until the
-    /// library or how it is dexed changes, it is the same for every build.
+    /// library or how it is dexed changes. `keep_rules` of R8 shrink it.
     pub fn dex_desugared_library(
         &self,
         library: &DesugaredLibrary,
+        keep_rules: Option<&Path>,
         dex_dir: &Path,
         work_dir: &Path,
     ) -> Result<(), String> {
+        let keep_rules_content = match keep_rules {
+            Some(rules) => system::read_file(rules)?,
+            None => String::new(),
+        };
+
         let mut hasher = DefaultHasher::new();
         (
             &self.sdk.d8,
@@ -725,6 +731,7 @@ impl AndroidBuild {
             self.build_type.name(),
             up_to_date::files_hash(&library.jars)?,
             system::read_file(&library.config)?,
+            keep_rules_content,
         )
             .hash(&mut hasher);
         let dexed = work_dir.join(format!("{:016x}", hasher.finish()));
@@ -747,8 +754,13 @@ impl AndroidBuild {
                 .arg("--desugared-lib")
                 .arg(&library.config)
                 .arg("--output")
-                .arg(&partial)
-                .args(&library.jars);
+                .arg(&partial);
+
+            if let Some(rules) = keep_rules {
+                command.arg("--pg-conf").arg(rules);
+            }
+
+            command.args(&library.jars);
             system::create_dir(&partial)?;
             system::run_command(&mut command, "L8")?;
             fs::rename(&partial, &dexed)
@@ -1193,14 +1205,18 @@ impl AndroidBuild {
         };
     }
 
-    /// API level the dex files are made for
-    fn min_api(&self) -> i64 {
-        return self.min_sdk.max(NATIVE_MULTIDEX_API);
+    /// API level the dex files are made for. R8 can put what starts the app
+    /// into the first dex file, d8 cannot.
+    pub fn min_api(&self) -> i64 {
+        return match self.build_type {
+            BuildType::Debug => self.min_sdk.max(NATIVE_MULTIDEX_API),
+            BuildType::Release => self.min_sdk,
+        };
     }
 }
 
 /// Each path once, in the order they come
-fn unique<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+pub fn unique<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     return paths
         .into_iter()
@@ -1568,9 +1584,9 @@ fn source_set_dirs_with_files(
         .collect();
 }
 
-/// d8 output worth showing, and how many lines of noise it hid: d8 warns about
-/// every class with Kotlin metadata newer than it knows, harmless for dexing
-fn split_d8_noise(text: &str) -> (Vec<&str>, usize) {
+/// Output of d8 and R8 worth showing, and how many lines of noise it hid: they warn
+/// about every class with Kotlin metadata newer than they know, harmless for dexing
+pub fn split_d8_noise(text: &str) -> (Vec<&str>, usize) {
     // a diagnostic starts with Warning/Info/Error and ends at the next one or an empty line
     let mut blocks: Vec<Vec<&str>> = vec![vec![]];
 
