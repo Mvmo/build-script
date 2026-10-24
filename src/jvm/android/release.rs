@@ -1,11 +1,18 @@
 // Release builds: R8 shrinks, optimizes and renames the code with the ProGuard rules of build-script,
-// of aapt2, of the libraries and of the app, then dexes it. The apk is signed with the key of the script.
+// of aapt2, of the libraries and of the app, then dexes it. The apk and the app bundle are signed
+// with the key of the script.
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::common::system;
+use crate::jvm::maven::{DependencyResolver, MavenCoordinate, TargetPlatform};
 use crate::language::runtime::Arguments;
 
-use super::build::{AndroidBuild, DesugaredLibrary, unique};
+use super::build::{AndroidBuild, DesugaredLibrary, Signature, unique};
+
+const BUNDLETOOL_VERSION: &str = "1.18.3";
+const BUNDLETOOL_MAIN_CLASS: &str = "com.android.tools.build.bundletool.BundleToolMain";
 
 /// What every app needs kept, like proguard-android-optimize.txt of the Android Gradle plugin
 const DEFAULT_RULES: &str = "\
@@ -269,6 +276,109 @@ pub fn shrink_with_r8(
     );
 
     return Ok(library_keep_rules);
+}
+
+/// The app bundle for Google Play with one module, base: the resources linked in protobuf
+/// format, the dex files, the native libraries and the Java resources. Signed with jarsigner
+/// like by the Gradle plugin.
+pub fn build_app_bundle(
+    build: &AndroidBuild,
+    proto_resources: &Path,
+    dex_dir: &Path,
+    java_resources: &Path,
+    native_libraries: &Path,
+    mapping: Option<&Path>,
+    signature: &Signature,
+    bundle: &Path,
+) -> Result<(), String> {
+    let work_dir = build.build_dir.join("intermediates/bundle");
+    let module = work_dir.join("base");
+    system::recreate_dir(&module)?;
+    system::extract(proto_resources, &module)?;
+
+    // bundletool wants the manifest in manifest/, the dex files in dex/, the Java resources in root/
+    system::create_dir(&module.join("manifest"))?;
+    fs::rename(
+        module.join("AndroidManifest.xml"),
+        module.join("manifest/AndroidManifest.xml"),
+    )
+    .map_err(|error| format!("could not move the manifest of the app bundle: {error}"))?;
+
+    for dex in system::files_with_extension(&[dex_dir.to_path_buf()], "dex") {
+        let name = dex.file_name().unwrap_or_default();
+        system::copy_file(&dex, &module.join("dex").join(name))?;
+    }
+
+    system::copy_dir_contents(native_libraries, &module)?;
+    system::copy_dir_contents(java_resources, &module.join("root"))?;
+
+    // zip adds to an archive that is already there
+    let module_zip = fs::canonicalize(&work_dir)
+        .map_err(|error| error.to_string())?
+        .join("base.zip");
+    let _ = fs::remove_file(&module_zip);
+
+    let mut zip = Command::new("zip");
+    zip.args(["-q", "-r"])
+        .arg(&module_zip)
+        .arg(".")
+        .current_dir(&module);
+    system::run_command(&mut zip, "zipping the base module")?;
+
+    let mut resolver =
+        DependencyResolver::new(build.inputs.repositories.clone(), TargetPlatform::Jvm);
+    let bundletool = resolver.resolve_with_platforms(
+        &[MavenCoordinate::new(
+            "com.android.tools.build",
+            "bundletool",
+            BUNDLETOOL_VERSION,
+        )],
+        &[],
+    )?;
+
+    let unsigned = work_dir.join("unsigned.aab");
+
+    let mut build_bundle = build.inputs.jdk.java_command(&bundletool, BUNDLETOOL_MAIN_CLASS)?;
+    build_bundle
+        .arg("build-bundle")
+        .arg(format!("--modules={}", module_zip.display()))
+        .arg(format!("--output={}", unsigned.display()))
+        .arg("--overwrite");
+
+    // Google Play reads the mapping from the bundle and shows readable stack traces
+    if let Some(mapping) = mapping {
+        build_bundle.arg(format!(
+            "--metadata-file=com.android.tools.build.obfuscation/proguard.map:{}",
+            mapping.display()
+        ));
+    }
+
+    system::run_command_quietly(&mut build_bundle, "bundletool build-bundle")?;
+
+    let mut validate = build.inputs.jdk.java_command(&bundletool, BUNDLETOOL_MAIN_CLASS)?;
+    validate.arg("validate").arg(format!("--bundle={}", unsigned.display()));
+    system::run_command_quietly(&mut validate, "bundletool validate")?;
+
+    system::create_parent_dir(bundle)?;
+
+    let Signature::Release(key) = signature else {
+        return system::copy_file(&unsigned, bundle);
+    };
+
+    // jarsigner reads the passwords from the environment, they stay out of the arguments
+    let mut sign = Command::new(build.inputs.jdk.tool_path("jarsigner"));
+    sign.arg("-keystore")
+        .arg(&key.keystore)
+        .arg("-storepass:env")
+        .arg(&key.keystore_password_env)
+        .arg("-keypass:env")
+        .arg(&key.key_password_env)
+        .arg("-signedjar")
+        .arg(bundle)
+        .arg(&unsigned)
+        .arg(&key.alias);
+
+    return system::run_command_quietly(&mut sign, "jarsigner");
 }
 
 #[cfg(test)]

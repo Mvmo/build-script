@@ -63,7 +63,7 @@ impl BuildType {
     }
 }
 
-/// What an apk is signed with
+/// What the apk and the app bundle are signed with
 pub enum Signature<'a> {
     /// the debug key every Android tool uses
     Debug,
