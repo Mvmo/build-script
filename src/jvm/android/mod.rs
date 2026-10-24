@@ -84,6 +84,8 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
             // only for build-script build --release: R8 with these rules besides the libraries'
             .with_default("minify", Type::Bool, true)
             .with_default("proguard_files", Type::list(Type::String), Value::string_list(&[]))
+            // release builds also build an app bundle for Google Play
+            .with_default("app_bundle", Type::Bool, false)
             // the release key, its passwords from environment variables the script names
             .optional("keystore", Type::String)
             .optional("key_alias", Type::String)
@@ -183,7 +185,8 @@ fn android_parameters(parameters: FunctionParameters) -> FunctionSignature {
 }
 
 /// An apk in build/outputs/apk/<build type>/: aapt2, kotlinc against android.jar, d8 or
-/// for release R8, aligned and signed with the debug key or the release key
+/// for release R8, aligned and signed with the debug key or the release key. Release builds
+/// with app_bundle also get an app bundle in build/outputs/bundle/release/.
 fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let inputs = read_android_inputs(context, args)?;
     let build_type = BuildType::of(context);
@@ -215,6 +218,13 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
         .join(build_type.name())
         .join(format!("{output_name}.apk"));
 
+    let app_bundle: bool = args.get("app_bundle")?;
+    let bundle = (build_type == BuildType::Release && app_bundle).then(|| {
+        build_dir
+            .join("outputs/bundle/release")
+            .join(format!("{output_name}.aab"))
+    });
+
     let mut input_paths = android_input_paths(&inputs, args, build_type)?;
     input_paths.extend(settings.proguard_files.iter().cloned());
     input_paths.extend(release_key.iter().map(|key| key.keystore.clone()));
@@ -234,8 +244,11 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
         ),
     }
 
+    let mut outputs: Vec<&Path> = vec![&apk, &manifest];
+    outputs.extend(bundle.as_deref());
+
     let (inputs, sdk, merged_manifest) =
-        if inputs.is_up_to_date(&fingerprint, &[&apk, &manifest])? {
+        if inputs.is_up_to_date(&fingerprint, &outputs)? {
             let merged_manifest = xml::parse(&system::read_file(&manifest)?)?;
             (inputs, android_sdk(args)?, merged_manifest)
         } else {
@@ -253,6 +266,7 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
                 manifest: &manifest,
                 signature: &signature,
                 output: &apk,
+                bundle: bundle.as_deref(),
             }
             .build(&build)?;
 
@@ -438,6 +452,8 @@ struct Apk<'a> {
     manifest: &'a Path,
     signature: &'a Signature<'a>,
     output: &'a Path,
+    /// release builds with app_bundle
+    bundle: Option<&'a Path>,
 }
 
 impl ApkSettings {
@@ -486,7 +502,8 @@ impl ApkSettings {
 
 impl Apk<'_> {
     /// Resources linked with aapt2, R and BuildConfig, Kotlin and Java, dex with d8 or R8,
-    /// packaged with the Java resources and native libraries. Returns the merged manifest.
+    /// packaged with the Java resources and native libraries, the app bundle too with `bundle`.
+    /// Returns the merged manifest.
     fn build(&self, build: &AndroidBuild) -> Result<XmlElement, String> {
         let settings = self.settings;
         let target_sdk = settings.target_sdk.unwrap_or(build.compile_sdk);
@@ -570,6 +587,23 @@ impl Apk<'_> {
             &symbols,
             &extra,
         )?;
+
+        // an app bundle has its resources in protobuf format
+        let proto_resources = intermediates.join("bundle/resources.zip");
+
+        if self.bundle.is_some() {
+            let mut proto_extra = extra.clone();
+            proto_extra.push("--proto-format".to_string());
+
+            build.link(
+                self.manifest,
+                &own_resources,
+                LinkedResources::App,
+                &proto_resources,
+                &intermediates.join("bundle/R.txt"),
+                &proto_extra,
+            )?;
+        }
 
         // the app generates the final R classes of all libraries
         let mut generated_sources = build.write_r_classes(
@@ -670,6 +704,22 @@ impl Apk<'_> {
             self.signature,
             self.output,
         )?;
+
+        if let Some(bundle) = self.bundle {
+            system::log(&build.inputs.name, "Building the app bundle");
+            let mapping = build.build_dir.join("outputs/mapping/release/mapping.txt");
+
+            release::build_app_bundle(
+                build,
+                &proto_resources,
+                &dex_dir,
+                &java_resources,
+                &native_libraries,
+                Some(mapping.as_path()).filter(|_| shrinks),
+                self.signature,
+                bundle,
+            )?;
+        }
 
         return Ok(merged_manifest);
     }
@@ -831,6 +881,7 @@ fn instrumented_tests(
             manifest: &manifest,
             signature: &Signature::Debug,
             output: &apk,
+            bundle: None,
         }
         .build(&build)?;
         build.inputs.finish(&fingerprint, &apk)?;

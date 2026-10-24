@@ -101,7 +101,7 @@ impl InstrumentedTests {
         install
             .args(["-s", &device, "install", "-r", "-t"])
             .arg(&self.apk);
-        run_quietly(&mut install, "adb install")?;
+        system::run_command_quietly(&mut install, "adb install")?;
 
         system::log(
             module,
@@ -115,7 +115,7 @@ impl InstrumentedTests {
 
         let mut uninstall = Command::new(&adb);
         uninstall.args(["-s", &device, "uninstall", &self.package]);
-        let uninstalled = run_quietly(&mut uninstall, "adb uninstall");
+        let uninstalled = system::run_command_quietly(&mut uninstall, "adb uninstall");
         let instrumentation = instrumentation?;
         uninstalled?;
 
@@ -171,31 +171,6 @@ fn instrument(adb: &Path, device: &str, component: &str) -> Result<Instrumentati
     }
 
     return Ok(instrumentation);
-}
-
-/// What the command prints only shows when it fails
-fn run_quietly(command: &mut Command, what: &str) -> Result<(), String> {
-    let output = command.stdin(Stdio::null()).output().map_err(|error| {
-        format!(
-            "could not start {}: {error}",
-            command.get_program().to_string_lossy()
-        )
-    })?;
-
-    if !output.status.success() {
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return Err(format!(
-            "{what} failed ({}): {}",
-            output.status,
-            text.trim()
-        ));
-    }
-
-    return Ok(());
 }
 
 /// The device adb works with: the one ANDROID_SERIAL names, the only one connected,

@@ -221,6 +221,31 @@ pub fn run_command(command: &mut Command, what: &str) -> Result<(), String> {
     return Ok(());
 }
 
+/// Like run_command, but what the tool prints only shows when it fails
+pub fn run_command_quietly(command: &mut Command, what: &str) -> Result<(), String> {
+    let output = command.stdin(Stdio::null()).output().map_err(|error| {
+        format!(
+            "could not start {}: {error}",
+            command.get_program().to_string_lossy()
+        )
+    })?;
+
+    if !output.status.success() {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Err(format!(
+            "{what} failed ({}): {}",
+            output.status,
+            text.trim()
+        ));
+    }
+
+    return Ok(());
+}
+
 /// For servers that want a user name and password. No Debug, the password must not end up in a log.
 pub struct Credentials {
     pub username: String,
