@@ -63,6 +63,8 @@ pub enum JvmLaunch {
         activity: Option<String>,
         /// lowest API level an emulator for the app may have
         min_sdk: i64,
+        /// release apks without a key in the script are not, Android does not install those
+        signed: bool,
     },
 }
 
@@ -92,7 +94,15 @@ pub fn launch(module: &BuiltModule, output: &JvmOutput, args: &[String]) -> Resu
             application_id,
             activity,
             min_sdk,
+            signed,
         }) => {
+            if !signed {
+                return Err(format!(
+                    "{} is not signed, Android only installs signed apps: give build_android a keystore",
+                    module.artifact.display()
+                ));
+            }
+
             if !args.is_empty() {
                 println!("Note: arguments are ignored for Android apps");
             }

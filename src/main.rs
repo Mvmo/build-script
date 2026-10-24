@@ -21,7 +21,7 @@ const USAGE: &str = "usage: build-script [build] [<script>]
        build-script config [<setting> [<value>]] | config --unset <setting>
 build, run and test take --jobs <n>, the number of modules built at the same time;
 they and install take --refresh, which asks the repositories again for the newest
-versions and SNAPSHOTs";
+versions and SNAPSHOTs; build and run take --release, which builds Android apps for release";
 
 /// what commands without a script argument build
 const DEFAULT_SCRIPT: &str = "project.build";
@@ -283,6 +283,12 @@ fn main() {
         std::process::exit(2);
     });
 
+    // tests run against debug builds, like with the Android Gradle plugin
+    if options.release && !matches!(command, Command::Build { .. } | Command::Run { .. }) {
+        eprintln!("--release only goes with build and run, tests run against debug builds");
+        std::process::exit(2);
+    }
+
     if options.refresh {
         jvm::maven::refresh();
     }
@@ -361,7 +367,7 @@ fn main() {
     };
 
     let jobs = options.jobs.unwrap_or_else(runtime::default_jobs);
-    let modules = run_script(script_path, tests, jobs);
+    let modules = run_script(script_path, tests, jobs, options.release);
 
     match &command {
         Command::Run { module, args, .. } => {
@@ -379,15 +385,22 @@ struct BuildOptions {
     jobs: Option<usize>,
     /// SNAPSHOTs are looked up again instead of once a day
     refresh: bool,
+    /// Android apps are built for release
+    release: bool,
 }
 
-/// `--jobs <n>` and `--refresh`, before the arguments of a program after `--`
+/// `--jobs <n>`, `--refresh` and `--release`, before the arguments of a program after `--`
 fn take_build_options(args: &[String]) -> Result<(BuildOptions, Vec<String>), String> {
     let program_args = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
     let (jobs, own) = take_option(&args[..program_args], "--jobs")?;
 
     let refresh = own.iter().any(|arg| arg == "--refresh");
-    let mut own: Vec<String> = own.into_iter().filter(|arg| arg != "--refresh").collect();
+    let release = own.iter().any(|arg| arg == "--release");
+
+    let mut own: Vec<String> = own
+        .into_iter()
+        .filter(|arg| arg != "--refresh" && arg != "--release")
+        .collect();
     own.extend(args[program_args..].iter().cloned());
 
     let jobs = match jobs {
@@ -400,11 +413,23 @@ fn take_build_options(args: &[String]) -> Result<(BuildOptions, Vec<String>), St
         None => None,
     };
 
-    return Ok((BuildOptions { jobs, refresh }, own));
+    return Ok((
+        BuildOptions {
+            jobs,
+            refresh,
+            release,
+        },
+        own,
+    ));
 }
 
 /// The modules the script built, the builds of independent modules ran in parallel
-fn run_script(script_path: &str, tests: TestSelection, jobs: usize) -> Vec<Arc<BuiltModule>> {
+fn run_script(
+    script_path: &str,
+    tests: TestSelection,
+    jobs: usize,
+    release: bool,
+) -> Vec<Arc<BuiltModule>> {
     let source = std::fs::read_to_string(script_path).unwrap_or_else(|error| {
         eprintln!("could not read {script_path}: {error}");
         std::process::exit(1);
@@ -426,7 +451,10 @@ fn run_script(script_path: &str, tests: TestSelection, jobs: usize) -> Vec<Arc<B
         .map(|parent| parent.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut runtime = Runtime::new(project_dir).with_tests(tests).with_jobs(jobs);
+    let mut runtime = Runtime::new(project_dir)
+        .with_tests(tests)
+        .with_jobs(jobs)
+        .with_release(release);
     let evaluated = runtime.run(&script);
 
     // builds that started before an error finish, none of their tools keep running
@@ -938,11 +966,12 @@ mod tests {
         let args = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
 
         assert_eq!(
-            take_build_options(&args(&["build", "--jobs", "3", "--refresh"])),
+            take_build_options(&args(&["build", "--jobs", "3", "--refresh", "--release"])),
             Ok((
                 BuildOptions {
                     jobs: Some(3),
-                    refresh: true
+                    refresh: true,
+                    release: true
                 },
                 args(&["build"])
             ))

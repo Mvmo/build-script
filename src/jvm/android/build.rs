@@ -23,6 +23,7 @@ use super::manifest::{
     expand_class_names, merge_manifest, move_aliases_last, read_manifest_with_placeholders,
     remove_entries_marked_for_removal,
 };
+use super::release::ReleaseKey;
 use super::sdk::{AndroidSdk, SdkCatalog};
 
 pub const DEFAULT_NDK_VERSION: &str = "28.2.13676358";
@@ -37,6 +38,39 @@ const CMAKE_VERSION: &str = "3.22.1";
 const ABIS: &[&str] = &["armeabi-v7a", "arm64-v8a", "x86", "x86_64"];
 /// the CMake builds, and the libraries in libs/<abi> like jniLibs
 const CMAKE_DIR: &str = "build/intermediates/cmake";
+
+/// Debug, or release with `build-script build --release`
+#[derive(Clone, Copy, PartialEq)]
+pub enum BuildType {
+    Debug,
+    Release,
+}
+
+impl BuildType {
+    pub fn of(context: &BuildScriptContext) -> Self {
+        return match context.release {
+            true => BuildType::Release,
+            false => BuildType::Debug,
+        };
+    }
+
+    /// Of the source set over src/main and of the output directories
+    pub fn name(self) -> &'static str {
+        return match self {
+            BuildType::Debug => "debug",
+            BuildType::Release => "release",
+        };
+    }
+}
+
+/// What an apk is signed with
+pub enum Signature<'a> {
+    /// the debug key every Android tool uses
+    Debug,
+    Release(&'a ReleaseKey),
+    /// a release build without a key in the script
+    Unsigned,
+}
 
 /// What aapt2 links: the app, or a library with or without the resources of its libraries
 #[derive(Clone, Copy, PartialEq)]
@@ -54,7 +88,8 @@ pub struct AndroidBuild {
     pub compile_sdk: i64,
     pub sdk: AndroidSdk,
     pub main_dir: PathBuf,
-    /// debug, or debugAndroidTest for the module with its instrumented tests
+    pub build_type: BuildType,
+    /// debug, release, or debugAndroidTest for the module with its instrumented tests
     variant: &'static str,
     pub build_dir: PathBuf,
     /// own res directories that contain files, lowest priority first
@@ -78,7 +113,7 @@ pub struct AndroidBuild {
     /// of `jars` the classes of library modules, they change with the app
     module_jars: Vec<PathBuf>,
     /// only to compile against
-    compile_only: Vec<PathBuf>,
+    pub compile_only: Vec<PathBuf>,
     /// aars and library modules with resources, lowest priority first
     libraries: Vec<AndroidResourceLibrary>,
     /// jniLibs directories and the libraries built with CMake
@@ -90,7 +125,7 @@ pub struct AndroidBuild {
 
 /// desugar_jdk_libs: its d8 configuration and its jars
 pub struct DesugaredLibrary {
-    config: PathBuf,
+    pub config: PathBuf,
     jars: Vec<PathBuf>,
 }
 
@@ -101,6 +136,20 @@ pub fn read_android_inputs(
     args: &Arguments,
 ) -> Result<ModuleBuildInputs, String> {
     let mut inputs = ModuleBuildInputs::read(context, args, Sources::KotlinAndJava)?;
+    let build_type = BuildType::of(context);
+
+    inputs.source_dirs = inputs
+        .source_dirs
+        .iter()
+        .map(|dir| dir_of_build_type(&inputs.directory, dir, build_type))
+        .collect();
+
+    inputs.resources.dirs = inputs
+        .resources
+        .dirs
+        .iter()
+        .map(|dir| dir_of_build_type(&inputs.directory, dir, build_type))
+        .collect();
 
     if args.get::<bool>("view_binding")? {
         inputs.dependencies.libraries.push(MavenCoordinate::new(
@@ -118,21 +167,36 @@ pub fn existing_dirs(
     inputs: &ModuleBuildInputs,
     args: &Arguments,
     name: &str,
+    build_type: BuildType,
 ) -> Result<Vec<PathBuf>, String> {
     let dirs: Vec<String> = args.get(name)?;
     return Ok(dirs
         .iter()
-        .map(|dir| inputs.directory.join(dir))
+        .map(|dir| dir_of_build_type(&inputs.directory, dir, build_type))
         .filter(|dir| system::contains_files(dir))
         .collect());
+}
+
+/// `dir` of the module. The defaults name src/debug, a release build takes src/release instead.
+fn dir_of_build_type(module_dir: &Path, dir: impl AsRef<Path>, build_type: BuildType) -> PathBuf {
+    let dir = module_dir.join(dir);
+
+    if build_type == BuildType::Release {
+        if let Ok(rest) = dir.strip_prefix(module_dir.join("src/debug")) {
+            return module_dir.join("src/release").join(rest);
+        }
+    }
+
+    return dir;
 }
 
 /// The module's jniLibs and, with a CMakeLists.txt, the libraries built from it
 pub fn native_library_dirs(
     inputs: &ModuleBuildInputs,
     args: &Arguments,
+    build_type: BuildType,
 ) -> Result<Vec<PathBuf>, String> {
-    let mut dirs = source_set_dirs_with_files(inputs, "jniLibs");
+    let mut dirs = source_set_dirs_with_files(inputs, "jniLibs", build_type);
 
     if args.get::<Option<String>>("cmake")?.is_some() {
         dirs.push(inputs.directory.join(CMAKE_DIR).join("libs"));
@@ -146,6 +210,7 @@ pub fn native_library_dirs(
 pub fn android_input_paths(
     inputs: &ModuleBuildInputs,
     args: &Arguments,
+    build_type: BuildType,
 ) -> Result<Vec<PathBuf>, String> {
     let mut paths: Vec<PathBuf> = ["res_dirs", "aidl_dirs", "asset_dirs"]
         .iter()
@@ -153,17 +218,13 @@ pub fn android_input_paths(
         .collect::<Result<Vec<_>, _>>()?
         .iter()
         .flatten()
-        .map(|dir| inputs.directory.join(dir))
+        .map(|dir| dir_of_build_type(&inputs.directory, dir, build_type))
         .collect();
 
-    for source_set in ["src/main", "src/debug"] {
-        paths.push(
-            inputs
-                .directory
-                .join(source_set)
-                .join("AndroidManifest.xml"),
-        );
-        paths.push(inputs.directory.join(source_set).join("jniLibs"));
+    for source_set in ["main", build_type.name()] {
+        let source_set_dir = inputs.directory.join("src").join(source_set);
+        paths.push(source_set_dir.join("AndroidManifest.xml"));
+        paths.push(source_set_dir.join("jniLibs"));
     }
 
     paths.extend(inputs.resources.inputs());
@@ -178,9 +239,13 @@ pub fn android_input_paths(
 }
 
 impl AndroidBuild {
-    pub fn prepare(inputs: ModuleBuildInputs, args: &Arguments) -> Result<Self, String> {
+    pub fn prepare(
+        inputs: ModuleBuildInputs,
+        args: &Arguments,
+        build_type: BuildType,
+    ) -> Result<Self, String> {
         let build_dir = inputs.directory.join("build");
-        return Self::prepare_variant(inputs, args, "debug", build_dir);
+        return Self::prepare_variant(inputs, args, build_type, build_type.name(), build_dir);
     }
 
     /// The module with its instrumented tests, built apart from the module: the
@@ -190,7 +255,8 @@ impl AndroidBuild {
         args: &Arguments,
     ) -> Result<Self, String> {
         let build_dir = inputs.directory.join("build/androidTest");
-        let mut build = Self::prepare_variant(inputs, args, "debugAndroidTest", build_dir)?;
+        let mut build =
+            Self::prepare_variant(inputs, args, BuildType::Debug, "debugAndroidTest", build_dir)?;
         let test_dir = build.inputs.directory.join("src/androidTest");
         build.res_dirs.extend(
             [test_dir.join("res")]
@@ -209,6 +275,7 @@ impl AndroidBuild {
     fn prepare_variant(
         inputs: ModuleBuildInputs,
         args: &Arguments,
+        build_type: BuildType,
         variant: &'static str,
         build_dir: PathBuf,
     ) -> Result<Self, String> {
@@ -253,14 +320,15 @@ impl AndroidBuild {
             compile_sdk,
             sdk,
             main_dir: inputs.directory.join("src/main"),
+            build_type,
             variant,
             build_dir,
-            res_dirs: existing_dirs(&inputs, args, "res_dirs")?,
-            asset_dirs: existing_dirs(&inputs, args, "asset_dirs")?,
+            res_dirs: existing_dirs(&inputs, args, "res_dirs", build_type)?,
+            asset_dirs: existing_dirs(&inputs, args, "asset_dirs", build_type)?,
             aidl_dirs: args
                 .get::<Vec<String>>("aidl_dirs")?
                 .iter()
-                .map(|dir| inputs.directory.join(dir))
+                .map(|dir| dir_of_build_type(&inputs.directory, dir, build_type))
                 .collect(),
             aidl_imports: unpacked.aidl_imports,
             view_binding: args.get("view_binding")?,
@@ -272,7 +340,7 @@ impl AndroidBuild {
             module_jars: unpacked.module_jars,
             compile_only: unpacked.compile_only,
             libraries: unpacked.libraries,
-            native_library_dirs: native_library_dirs(&inputs, args)?,
+            native_library_dirs: native_library_dirs(&inputs, args, build_type)?,
             cmake_lists: args
                 .get::<Option<String>>("cmake")?
                 .map(|cmake| inputs.directory.join(cmake)),
@@ -319,23 +387,27 @@ impl AndroidBuild {
             )?,
         };
 
-        // the debug source set wins over main
-        let debug_manifest = self.inputs.directory.join("src/debug/AndroidManifest.xml");
-        if debug_manifest.is_file() {
-            let mut debug = read_manifest_with_placeholders(
-                &debug_manifest,
+        // the source set of the build type wins over main
+        let build_type_manifest = self
+            .inputs
+            .directory
+            .join(format!("src/{}/AndroidManifest.xml", self.build_type.name()));
+
+        if build_type_manifest.is_file() {
+            let mut over_main = read_manifest_with_placeholders(
+                &build_type_manifest,
                 application_id,
                 &self.manifest_placeholders,
             )?;
 
             for (key, value) in &manifest.attributes {
-                if debug.attribute(key).is_none() {
-                    debug.attributes.push((key.clone(), value.clone()));
+                if over_main.attribute(key).is_none() {
+                    over_main.attributes.push((key.clone(), value.clone()));
                 }
             }
 
-            merge_manifest(&mut debug, &manifest);
-            manifest = debug;
+            merge_manifest(&mut over_main, &manifest);
+            manifest = over_main;
         }
 
         if let Some(overlay) = overlay {
@@ -463,12 +535,12 @@ impl AndroidBuild {
         return Ok(files);
     }
 
-    /// Of a debug build in the namespace, like the Gradle plugin writes it:
-    /// `fields` ("Type NAME value"), then build_config_fields
+    /// In the namespace, like the Gradle plugin writes it: `fields` ("Type NAME value"),
+    /// then build_config_fields
     pub fn write_build_config(&self, fields: &[String]) -> Result<PathBuf, String> {
         let mut declarations = vec![
-            "boolean DEBUG true".to_string(),
-            "String BUILD_TYPE debug".to_string(),
+            format!("boolean DEBUG {}", self.build_type == BuildType::Debug),
+            format!("String BUILD_TYPE {}", self.build_type.name()),
         ];
 
         declarations.extend(fields.iter().cloned());
@@ -515,6 +587,7 @@ impl AndroidBuild {
             sdk_root: &self.sdk.root,
             ndk_version: &self.ndk_version,
             min_sdk: self.min_sdk,
+            build_type: self.build_type,
             work_dir: self.inputs.directory.join(CMAKE_DIR),
             accept_license: self.accept_license,
         }
@@ -637,20 +710,28 @@ impl AndroidBuild {
     }
 
     /// With L8, added after the app's dex files. Kept in `work_dir` until the
-    /// library or how it is dexed changes, it is the same for every build.
+    /// library or how it is dexed changes. `keep_rules` of R8 shrink it.
     pub fn dex_desugared_library(
         &self,
         library: &DesugaredLibrary,
+        keep_rules: Option<&Path>,
         dex_dir: &Path,
         work_dir: &Path,
     ) -> Result<(), String> {
+        let keep_rules_content = match keep_rules {
+            Some(rules) => system::read_file(rules)?,
+            None => String::new(),
+        };
+
         let mut hasher = DefaultHasher::new();
         (
             &self.sdk.d8,
             &self.sdk.android_jar,
             self.min_api(),
+            self.build_type.name(),
             up_to_date::files_hash(&library.jars)?,
             system::read_file(&library.config)?,
+            keep_rules_content,
         )
             .hash(&mut hasher);
         let dexed = work_dir.join(format!("{:016x}", hasher.finish()));
@@ -665,7 +746,7 @@ impl AndroidBuild {
                 .java_command(&[self.sdk.d8.clone()], "com.android.tools.r8.L8")?;
 
             command
-                .arg("--debug")
+                .arg(self.dex_mode())
                 .arg("--min-api")
                 .arg(self.min_api().to_string())
                 .arg("--lib")
@@ -673,8 +754,13 @@ impl AndroidBuild {
                 .arg("--desugared-lib")
                 .arg(&library.config)
                 .arg("--output")
-                .arg(&partial)
-                .args(&library.jars);
+                .arg(&partial);
+
+            if let Some(rules) = keep_rules {
+                command.arg("--pg-conf").arg(rules);
+            }
+
+            command.args(&library.jars);
             system::create_dir(&partial)?;
             system::run_command(&mut command, "L8")?;
             fs::rename(&partial, &dexed)
@@ -749,6 +835,7 @@ impl AndroidBuild {
             &self.sdk.d8,
             &self.sdk.android_jar,
             self.min_api(),
+            self.build_type.name(),
             up_to_date::files_hash(libraries)?,
         )
             .hash(&mut hasher);
@@ -798,7 +885,7 @@ impl AndroidBuild {
             .java_command(&[self.sdk.d8.clone()], "com.android.tools.r8.D8")?;
 
         command
-            .arg("--debug")
+            .arg(self.dex_mode())
             .arg("--min-api")
             .arg(self.min_api().to_string())
             .arg("--lib")
@@ -816,10 +903,15 @@ impl AndroidBuild {
 
         command.args(inputs);
 
+        return self.run_dex_tool(&mut command, "d8");
+    }
+
+    /// d8 or R8, with the notes split_d8_noise hides only counted
+    pub fn run_dex_tool(&self, command: &mut Command, tool: &str) -> Result<(), String> {
         let result = command
             .stdin(Stdio::null())
             .output()
-            .map_err(|error| format!("could not start d8: {error}"))?;
+            .map_err(|error| format!("could not start {tool}: {error}"))?;
 
         let text = format!(
             "{}{}",
@@ -829,7 +921,7 @@ impl AndroidBuild {
 
         if !result.status.success() {
             eprint!("{text}");
-            return Err(format!("d8 failed ({})", result.status));
+            return Err(format!("{tool} failed ({})", result.status));
         }
 
         let (shown, hidden) = split_d8_noise(&text);
@@ -839,18 +931,16 @@ impl AndroidBuild {
         }
 
         if hidden > 0 {
-            system::log(
-                &self.inputs.name,
-                &format!(
-                    "d8: hid {hidden} lines of notes about libraries (Kotlin metadata newer than this d8 knows, stripped debug info)",
-                ),
+            let message = format!(
+                "{tool}: hid {hidden} lines of notes, most about Kotlin metadata newer than this {tool} knows"
             );
+            system::log(&self.inputs.name, &message);
         }
 
         return Ok(());
     }
 
-    /// Resources, dex, Java resources and native libraries, aligned and signed with the debug key
+    /// Resources, dex, Java resources and native libraries, aligned and signed as `signature` says
     pub fn package(
         &self,
         linked: &Path,
@@ -858,6 +948,7 @@ impl AndroidBuild {
         java_resources: &Path,
         native_libraries: &Path,
         work_dir: &Path,
+        signature: &Signature,
         apk: &Path,
     ) -> Result<(), String> {
         let unaligned = work_dir.join("unaligned.apk");
@@ -913,23 +1004,39 @@ impl AndroidBuild {
         system::run_command(&mut zipalign, "zipalign")?;
 
         system::create_parent_dir(apk)?;
-        let keystore = debug_keystore(&self.inputs.jdk)?;
+
         let mut sign = Command::new(self.inputs.jdk.tool_path("java"));
-        sign.arg("-jar")
-            .arg(&self.sdk.apksigner)
-            .arg("sign")
-            .arg("--ks")
-            .arg(&keystore)
-            // the well known password of the debug key every Android tool uses
-            .args([
-                "--ks-pass",
-                "pass:android",
-                "--key-pass",
-                "pass:android",
-                "--ks-key-alias",
-                "androiddebugkey",
-            ])
-            .arg("--min-sdk-version")
+        sign.arg("-jar").arg(&self.sdk.apksigner).arg("sign");
+
+        match signature {
+            Signature::Unsigned => return system::copy_file(&aligned, apk),
+            Signature::Debug => {
+                sign.arg("--ks")
+                    .arg(debug_keystore(&self.inputs.jdk)?)
+                    // the well known password of the debug key every Android tool uses
+                    .args([
+                        "--ks-pass",
+                        "pass:android",
+                        "--key-pass",
+                        "pass:android",
+                        "--ks-key-alias",
+                        "androiddebugkey",
+                    ]);
+            }
+            // apksigner reads the passwords from the environment, they stay out of the arguments
+            Signature::Release(key) => {
+                sign.arg("--ks")
+                    .arg(&key.keystore)
+                    .arg("--ks-key-alias")
+                    .arg(&key.alias)
+                    .arg("--ks-pass")
+                    .arg(format!("env:{}", key.keystore_password_env))
+                    .arg("--key-pass")
+                    .arg(format!("env:{}", key.key_password_env));
+            }
+        }
+
+        sign.arg("--min-sdk-version")
             .arg(self.min_sdk.to_string())
             .arg("--out")
             .arg(apk)
@@ -1093,14 +1200,35 @@ impl AndroidBuild {
         return Ok(output);
     }
 
-    /// API level the dex files are made for
-    fn min_api(&self) -> i64 {
-        return self.min_sdk.max(NATIVE_MULTIDEX_API);
+    /// --debug keeps the debug information in the dex files, --release does not
+    fn dex_mode(&self) -> &'static str {
+        return match self.build_type {
+            BuildType::Debug => "--debug",
+            BuildType::Release => "--release",
+        };
+    }
+
+    /// The ProGuard rules the aars and library modules bring for the apps using them
+    pub fn library_proguard_rules(&self) -> Vec<PathBuf> {
+        return self
+            .libraries
+            .iter()
+            .flat_map(|library| library.proguard_rules.iter().cloned())
+            .collect();
+    }
+
+    /// API level the dex files are made for. R8 can put what starts the app
+    /// into the first dex file, d8 cannot.
+    pub fn min_api(&self) -> i64 {
+        return match self.build_type {
+            BuildType::Debug => self.min_sdk.max(NATIVE_MULTIDEX_API),
+            BuildType::Release => self.min_sdk,
+        };
     }
 }
 
 /// Each path once, in the order they come
-fn unique<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+pub fn unique<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     return paths
         .into_iter()
@@ -1137,6 +1265,8 @@ struct AndroidResourceLibrary {
     asset_dirs: Vec<PathBuf>,
     /// directories with <abi>/*.so: jni/ of aars, jniLibs/ of modules
     native_library_dirs: Vec<PathBuf>,
+    /// for the apps using it: proguard.txt of aars, consumer_proguard_files of modules
+    proguard_rules: Vec<PathBuf>,
 }
 
 /// What the libraries of a module bring: classes to compile against and to
@@ -1206,6 +1336,7 @@ impl UnpackedLibraries {
                 symbols: android.symbols.clone(),
                 asset_dirs: android.asset_dirs.clone(),
                 native_library_dirs: android.native_library_dirs.clone(),
+                proguard_rules: android.consumer_proguard_files.clone(),
             });
         }
 
@@ -1292,6 +1423,10 @@ impl UnpackedLibraries {
                 .into_iter()
                 .filter(|dir| system::contains_files(dir))
                 .collect(),
+            proguard_rules: [target.join("proguard.txt")]
+                .into_iter()
+                .filter(|rules| rules.is_file())
+                .collect(),
         });
     }
 }
@@ -1302,6 +1437,7 @@ struct CMakeBuild<'a> {
     sdk_root: &'a Path,
     ndk_version: &'a str,
     min_sdk: i64,
+    build_type: BuildType,
     /// CMAKE_DIR of the module
     work_dir: PathBuf,
     accept_license: bool,
@@ -1309,7 +1445,7 @@ struct CMakeBuild<'a> {
 
 impl CMakeBuild<'_> {
     /// Installs the NDK and CMake if needed, then configures and builds the
-    /// libraries for every ABI, a debug build like the Gradle plugin's
+    /// libraries for every ABI, like the Gradle plugin
     fn run(&self, log: &dyn Fn(&str)) -> Result<(), String> {
         let ndk = self.sdk_root.join("ndk").join(self.ndk_version);
         let cmake_home = self.sdk_root.join("cmake").join(CMAKE_VERSION);
@@ -1368,7 +1504,10 @@ impl CMakeBuild<'_> {
                 .arg(format!("-DANDROID_NDK={}", ndk.display()))
                 .arg(format!("-DANDROID_ABI={abi}"))
                 .arg(format!("-DANDROID_PLATFORM=android-{}", self.min_sdk))
-                .arg("-DCMAKE_BUILD_TYPE=Debug")
+                .arg(match self.build_type {
+                    BuildType::Debug => "-DCMAKE_BUILD_TYPE=Debug",
+                    BuildType::Release => "-DCMAKE_BUILD_TYPE=Release",
+                })
                 .arg(format!(
                     "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}",
                     libraries.join(abi).display()
@@ -1451,17 +1590,21 @@ fn compile_resources(aapt2: &Path, res_dir: &Path, output: &Path) -> Result<(), 
         .map_err(|error| format!("could not save {}: {error}", output.display()));
 }
 
-/// `name` (jniLibs) of the main and the debug source set where it has files, lowest priority first
-fn source_set_dirs_with_files(inputs: &ModuleBuildInputs, name: &str) -> Vec<PathBuf> {
-    return ["src/main", "src/debug"]
+/// `name` (jniLibs) of the main source set and of the build type's where it has files, lowest priority first
+fn source_set_dirs_with_files(
+    inputs: &ModuleBuildInputs,
+    name: &str,
+    build_type: BuildType,
+) -> Vec<PathBuf> {
+    return ["main", build_type.name()]
         .iter()
-        .map(|source_set| inputs.directory.join(source_set).join(name))
+        .map(|source_set| inputs.directory.join("src").join(source_set).join(name))
         .filter(|dir| system::contains_files(dir))
         .collect();
 }
 
-/// d8 output worth showing, and how many lines of noise it hid: d8 warns about
-/// every class with Kotlin metadata newer than it knows, harmless for dexing
+/// Output of d8 and R8 worth showing, and how many lines of noise it hid: they warn
+/// about every class with Kotlin metadata newer than they know, harmless for dexing
 fn split_d8_noise(text: &str) -> (Vec<&str>, usize) {
     // a diagnostic starts with Warning/Info/Error and ends at the next one or an empty line
     let mut blocks: Vec<Vec<&str>> = vec![vec![]];
