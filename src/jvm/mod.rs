@@ -63,7 +63,7 @@ pub enum JvmLaunch {
         activity: Option<String>,
         /// lowest API level an emulator for the app may have
         min_sdk: i64,
-        /// release apks are not, Android does not install those
+        /// release apks without a key in the script are not, Android does not install those
         signed: bool,
     },
 }
@@ -98,7 +98,7 @@ pub fn launch(module: &BuiltModule, output: &JvmOutput, args: &[String]) -> Resu
         }) => {
             if !signed {
                 return Err(format!(
-                    "{} is not signed, Android only installs signed apps",
+                    "{} is not signed, Android only installs signed apps: give build_android a keystore",
                     module.artifact.display()
                 ));
             }

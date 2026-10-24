@@ -23,6 +23,7 @@ use super::manifest::{
     expand_class_names, merge_manifest, move_aliases_last, read_manifest_with_placeholders,
     remove_entries_marked_for_removal,
 };
+use super::release::ReleaseKey;
 use super::sdk::{AndroidSdk, SdkCatalog};
 
 pub const DEFAULT_NDK_VERSION: &str = "28.2.13676358";
@@ -63,9 +64,10 @@ impl BuildType {
 }
 
 /// What an apk is signed with
-pub enum Signature {
+pub enum Signature<'a> {
     /// the debug key every Android tool uses
     Debug,
+    Release(&'a ReleaseKey),
     /// a release build without a key in the script
     Unsigned,
 }
@@ -1005,6 +1007,17 @@ impl AndroidBuild {
                         "--ks-key-alias",
                         "androiddebugkey",
                     ]);
+            }
+            // apksigner reads the passwords from the environment, they stay out of the arguments
+            Signature::Release(key) => {
+                sign.arg("--ks")
+                    .arg(&key.keystore)
+                    .arg("--ks-key-alias")
+                    .arg(&key.alias)
+                    .arg("--ks-pass")
+                    .arg(format!("env:{}", key.keystore_password_env))
+                    .arg("--key-pass")
+                    .arg(format!("env:{}", key.key_password_env));
             }
         }
 

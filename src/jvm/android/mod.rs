@@ -3,6 +3,7 @@ mod build;
 mod device;
 mod generated;
 mod manifest;
+mod release;
 mod sdk;
 
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ use build::{
 use device::InstrumentedTests;
 use generated::SymbolTable;
 use manifest::{launcher_activity, read_manifest_with_placeholders};
+use release::ReleaseKey;
 use sdk::AndroidSdk;
 
 pub use device::install_and_start;
@@ -76,7 +78,12 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
             .with_default("version_name", Type::String, "1.0")
             .optional("core_library_desugaring", Type::String)
             // asset name of a JSON report of the libraries' licenses
-            .optional("license_report", Type::String),
+            .optional("license_report", Type::String)
+            // the release key, its passwords from environment variables the script names
+            .optional("keystore", Type::String)
+            .optional("key_alias", Type::String)
+            .optional("keystore_password_env", Type::String)
+            .optional("key_password_env", Type::String),
     );
 
     let library = android_parameters(
@@ -165,7 +172,7 @@ fn android_parameters(parameters: FunctionParameters) -> FunctionSignature {
 }
 
 /// An apk in build/outputs/apk/<build type>/: aapt2, kotlinc against android.jar, d8,
-/// aligned and signed with the debug key, unsigned for release
+/// aligned and signed with the debug key or the release key
 fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value, String> {
     let inputs = read_android_inputs(context, args)?;
     let build_type = BuildType::of(context);
@@ -174,13 +181,21 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
     let build_dir = inputs.directory.join("build");
     let manifest = build_dir.join("intermediates/manifest/AndroidManifest.xml");
 
-    let signature = match build_type {
-        BuildType::Debug => Signature::Debug,
-        BuildType::Release => Signature::Unsigned,
+    // debug builds work without the passwords of the release key
+    let release_key = match build_type {
+        BuildType::Debug => None,
+        BuildType::Release => ReleaseKey::read(args, &context.project_dir)?,
+    };
+
+    let signature = match (build_type, &release_key) {
+        (BuildType::Debug, _) => Signature::Debug,
+        (BuildType::Release, Some(key)) => Signature::Release(key),
+        (BuildType::Release, None) => Signature::Unsigned,
     };
 
     let output_name = match signature {
         Signature::Debug => format!("{}-debug", inputs.name),
+        Signature::Release(_) => format!("{}-release", inputs.name),
         Signature::Unsigned => format!("{}-release-unsigned", inputs.name),
     };
 
@@ -189,16 +204,22 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
         .join(build_type.name())
         .join(format!("{output_name}.apk"));
 
-    let mut fingerprint = inputs.input_fingerprint(
-        &inputs.name,
-        args,
-        &android_input_paths(&inputs, args, build_type)?,
-    )?;
+    let mut input_paths = android_input_paths(&inputs, args, build_type)?;
+    input_paths.extend(release_key.iter().map(|key| key.keystore.clone()));
+
+    let mut fingerprint = inputs.input_fingerprint(&inputs.name, args, &input_paths)?;
     fingerprint.add(build_type.name());
 
     match signature {
         Signature::Debug => {}
-        Signature::Unsigned => system::log(&inputs.name, "Release build, unsigned"),
+        Signature::Release(key) => system::log(
+            &inputs.name,
+            &format!("Release build, signed with {} from {}", key.alias, key.keystore.display()),
+        ),
+        Signature::Unsigned => system::log(
+            &inputs.name,
+            "Release build, unsigned: build_android has no keystore",
+        ),
     }
 
     let (inputs, sdk, merged_manifest) =
@@ -396,7 +417,7 @@ struct Apk<'a> {
     test_manifest: Option<&'a XmlElement>,
     /// the merged manifest
     manifest: &'a Path,
-    signature: &'a Signature,
+    signature: &'a Signature<'a>,
     output: &'a Path,
 }
 
