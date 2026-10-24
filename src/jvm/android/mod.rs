@@ -61,6 +61,8 @@ pub struct AndroidResources {
     pub native_library_dirs: Vec<PathBuf>,
     /// the library has <Layout>Binding classes in <namespace>.databinding
     pub view_binding: bool,
+    /// ProGuard rules for release builds of the apps using the library
+    pub consumer_proguard_files: Vec<PathBuf>,
 }
 
 pub fn builtins() -> Vec<(&'static str, Value)> {
@@ -79,7 +81,7 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
             .optional("core_library_desugaring", Type::String)
             // asset name of a JSON report of the libraries' licenses
             .optional("license_report", Type::String)
-            // only for build-script build --release: R8 with these rules
+            // only for build-script build --release: R8 with these rules besides the libraries'
             .with_default("minify", Type::Bool, true)
             .with_default("proguard_files", Type::list(Type::String), Value::string_list(&[]))
             // the release key, its passwords from environment variables the script names
@@ -96,7 +98,13 @@ pub fn builtins() -> Vec<(&'static str, Value)> {
             .required("dependencies", dependencies_type())
             .required("repositories", Type::list(Type::String))
             .with_default("min_sdk", Type::Int, DEFAULT_MIN_SDK)
-            .with_default("compile_sdk", Type::Int, DEFAULT_COMPILE_SDK),
+            .with_default("compile_sdk", Type::Int, DEFAULT_COMPILE_SDK)
+            // ProGuard rules for release builds of the apps using the library
+            .with_default(
+                "consumer_proguard_files",
+                Type::list(Type::String),
+                Value::string_list(&[]),
+            ),
     );
 
     return vec![
@@ -288,6 +296,9 @@ fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Resu
     let build_type = BuildType::of(context);
     let namespace: String = args.get("namespace")?;
 
+    let consumer_proguard_files =
+        required_module_files(args, "consumer_proguard_files", &inputs.directory)?;
+
     let source_manifest = Some(inputs.directory.join("src/main/AndroidManifest.xml"))
         .filter(|manifest| manifest.is_file());
 
@@ -304,6 +315,7 @@ fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Resu
         asset_dirs: existing_dirs(&inputs, args, "asset_dirs", build_type)?,
         native_library_dirs: native_library_dirs(&inputs, args, build_type)?,
         view_binding: args.get("view_binding")?,
+        consumer_proguard_files,
     };
 
     let mut fingerprint = inputs.input_fingerprint(
@@ -583,6 +595,25 @@ impl Apk<'_> {
             build.jar(&generated, &intermediates.join("jars/generated.jar"))?,
         ];
 
+        // the app's own Java resources come first, the first jar wins
+        let module_resources = intermediates.join("java-resources-module");
+        build
+            .inputs
+            .resources
+            .process(&generated_resources, &module_resources)?;
+
+        let mut resource_jars =
+            vec![build.jar(&module_resources, &intermediates.join("jars/resources.jar"))?];
+
+        resource_jars.extend(own_jars.iter().chain(&build.jars).cloned());
+        let java_resources = intermediates.join("java-resources");
+        merge_jars(
+            &resource_jars,
+            JarContents::JavaResources,
+            &java_resources,
+            &intermediates.join("java-resources.tmp"),
+        )?;
+
         let dex_dir = intermediates.join("dex");
 
         let desugared = match &settings.core_library_desugaring {
@@ -597,8 +628,10 @@ impl Apk<'_> {
         if shrinks {
             system::log(&build.inputs.name, "Shrinking and dexing with R8");
             let rules = release::proguard_rule_files(
+                build,
                 &settings.proguard_files,
                 &aapt2_rules,
+                &java_resources,
                 &proguard_dir,
             )?;
 
@@ -625,25 +658,6 @@ impl Apk<'_> {
         }
 
         system::log(&build.inputs.name, "Packaging");
-        // the app's own Java resources come first, the first jar wins
-        let module_resources = intermediates.join("java-resources-module");
-        build
-            .inputs
-            .resources
-            .process(&generated_resources, &module_resources)?;
-
-        let mut resource_jars =
-            vec![build.jar(&module_resources, &intermediates.join("jars/resources.jar"))?];
-
-        resource_jars.extend(own_jars.iter().chain(&build.jars).cloned());
-        let java_resources = intermediates.join("java-resources");
-        merge_jars(
-            &resource_jars,
-            JarContents::JavaResources,
-            &java_resources,
-            &intermediates.join("java-resources.tmp"),
-        )?;
-
         let native_libraries = intermediates.join("native-libraries");
         build.merge_native_libraries(&native_libraries)?;
 

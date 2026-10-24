@@ -587,6 +587,7 @@ impl ModuleBuildInputs {
             if let Some(android) = &module.jvm().android {
                 fingerprint.add_files(&android.res_dirs)?;
                 fingerprint.add_files(&android.manifest.iter().cloned().collect::<Vec<_>>())?;
+                fingerprint.add_files(&android.consumer_proguard_files)?;
             }
         }
 

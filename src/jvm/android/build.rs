@@ -1205,6 +1205,15 @@ impl AndroidBuild {
         };
     }
 
+    /// The ProGuard rules the aars and library modules bring for the apps using them
+    pub fn library_proguard_rules(&self) -> Vec<PathBuf> {
+        return self
+            .libraries
+            .iter()
+            .flat_map(|library| library.proguard_rules.iter().cloned())
+            .collect();
+    }
+
     /// API level the dex files are made for. R8 can put what starts the app
     /// into the first dex file, d8 cannot.
     pub fn min_api(&self) -> i64 {
@@ -1253,6 +1262,8 @@ struct AndroidResourceLibrary {
     asset_dirs: Vec<PathBuf>,
     /// directories with <abi>/*.so: jni/ of aars, jniLibs/ of modules
     native_library_dirs: Vec<PathBuf>,
+    /// for the apps using it: proguard.txt of aars, consumer_proguard_files of modules
+    proguard_rules: Vec<PathBuf>,
 }
 
 /// What the libraries of a module bring: classes to compile against and to
@@ -1322,6 +1333,7 @@ impl UnpackedLibraries {
                 symbols: android.symbols.clone(),
                 asset_dirs: android.asset_dirs.clone(),
                 native_library_dirs: android.native_library_dirs.clone(),
+                proguard_rules: android.consumer_proguard_files.clone(),
             });
         }
 
@@ -1407,6 +1419,10 @@ impl UnpackedLibraries {
             native_library_dirs: [target.join("jni")]
                 .into_iter()
                 .filter(|dir| system::contains_files(dir))
+                .collect(),
+            proguard_rules: [target.join("proguard.txt")]
+                .into_iter()
+                .filter(|rules| rules.is_file())
                 .collect(),
         });
     }

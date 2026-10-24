@@ -1,5 +1,5 @@
 // Release builds: R8 shrinks, optimizes and renames the code with the ProGuard rules of build-script,
-// of aapt2 and of the app, then dexes it. The apk is signed with the key of the script.
+// of aapt2, of the libraries and of the app, then dexes it. The apk is signed with the key of the script.
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -109,17 +109,93 @@ impl ReleaseKey {
 }
 
 /// Every ProGuard rule file of a release build: build-script's, those aapt2 wrote for
-/// the manifest and the layouts, then the app's own
+/// the manifest and the layouts, those of the aars, library modules and jars, those
+/// for the services of `java_resources`, then the app's own
 pub fn proguard_rule_files(
+    build: &AndroidBuild,
     app_rules: &[PathBuf],
     aapt2_rules: &Path,
+    java_resources: &Path,
     work_dir: &Path,
 ) -> Result<Vec<PathBuf>, String> {
+    system::recreate_dir(&work_dir.join("libraries"))?;
+
     let default_rules = work_dir.join("default.pro");
     system::write_file(&default_rules, DEFAULT_RULES)?;
 
+    let service_rules = work_dir.join("services.pro");
+    system::write_file(&service_rules, &keep_rules_for_services(java_resources)?)?;
+
     let mut rules = vec![default_rules, aapt2_rules.to_path_buf()];
+    rules.extend(build.library_proguard_rules());
+
+    for jar in unique(&build.jars) {
+        for entry in rule_entries_in_jar(&jar)? {
+            let file = work_dir
+                .join("libraries")
+                .join(format!("{}-{}", rules.len(), entry.replace('/', "-")));
+
+            let content = system::read_zip_entry(&jar, &entry)?;
+            system::write_file(&file, &String::from_utf8_lossy(&content))?;
+            rules.push(file);
+        }
+    }
+
+    rules.push(service_rules);
     rules.extend(app_rules.iter().cloned());
+
+    return Ok(rules);
+}
+
+/// The rule files a library keeps in its jar: those for R8 in META-INF/com.android.tools,
+/// else those for ProGuard in META-INF/proguard
+fn rule_entries_in_jar(jar: &Path) -> Result<Vec<String>, String> {
+    let entries = system::zip_entries(jar)?;
+    let files = entries.iter().filter(|entry| !entry.ends_with('/'));
+
+    let has_r8_rules = entries
+        .iter()
+        .any(|entry| entry.starts_with("META-INF/com.android.tools/"));
+
+    if !has_r8_rules {
+        return Ok(files
+            .filter(|entry| entry.starts_with("META-INF/proguard/"))
+            .cloned()
+            .collect());
+    }
+
+    // r8-from-<version> and r8-upto-<version> name the R8 versions the rules are for;
+    // the R8 of the build tools is newer than every from and than no upto
+    return Ok(files
+        .filter(|entry| {
+            let directory = entry
+                .strip_prefix("META-INF/com.android.tools/")
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or("");
+
+            directory == "r8" || (directory.starts_with("r8-from-") && !directory.contains("upto"))
+        })
+        .cloned()
+        .collect());
+}
+
+/// The classes the service files name keep their names: the Java resources are
+/// packaged as they are, not by R8
+fn keep_rules_for_services(java_resources: &Path) -> Result<String, String> {
+    let mut rules = String::new();
+
+    for file in system::files_below(&[java_resources.join("META-INF/services")]) {
+        let service = file.file_name().unwrap_or_default().to_string_lossy();
+        rules.push_str(&format!("-keepnames class {service}\n"));
+
+        for line in system::read_file(&file)?.lines() {
+            let provider = line.split('#').next().unwrap_or("").trim();
+
+            if !provider.is_empty() {
+                rules.push_str(&format!("-keep class {provider} {{ <init>(); }}\n"));
+            }
+        }
+    }
 
     return Ok(rules);
 }
