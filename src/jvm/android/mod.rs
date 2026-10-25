@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::common::system;
 use crate::common::xml::{self, XmlElement};
 use crate::jvm::JvmLaunch;
+use crate::jvm::idea;
 use crate::jvm::jar_merge::{JarContents, merge_jars};
 use crate::jvm::maven::{MavenCoordinate, TargetPlatform};
 use crate::jvm::module::{
@@ -244,8 +245,11 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
         ),
     }
 
+    // a missing IntelliJ module file builds the module again
+    let idea_file = context.idea.then(|| idea::module_file(&context.project_dir, &inputs.name));
     let mut outputs: Vec<&Path> = vec![&apk, &manifest];
     outputs.extend(bundle.as_deref());
+    outputs.extend(idea_file.as_deref());
 
     let (inputs, sdk, merged_manifest) =
         if inputs.is_up_to_date(&fingerprint, &outputs)? {
@@ -253,6 +257,12 @@ fn build_android(context: &BuildScriptContext, args: &Arguments) -> Result<Value
             (inputs, android_sdk(args)?, merged_manifest)
         } else {
             let build = AndroidBuild::prepare(inputs, args, build_type)?;
+
+            // before compiling: IntelliJ sees new libraries even while the code does not compile
+            if context.idea {
+                build.write_idea_module(&context.project_dir, args)?;
+            }
+
             let source_manifest = build.main_dir.join("AndroidManifest.xml");
 
             if !source_manifest.is_file() {
@@ -339,7 +349,11 @@ fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Resu
     )?;
     fingerprint.add(build_type.name());
 
-    let (inputs, sdk) = if inputs.is_up_to_date(&fingerprint, &[&jar])? {
+    let idea_file = context.idea.then(|| idea::module_file(&context.project_dir, &inputs.name));
+    let mut outputs = vec![jar.as_path()];
+    outputs.extend(idea_file.as_deref());
+
+    let (inputs, sdk) = if inputs.is_up_to_date(&fingerprint, &outputs)? {
         // only the tests need the SDK then
         let sdk = if context.tests.includes(&inputs.name) {
             Some(android_sdk(args)?)
@@ -349,6 +363,11 @@ fn build_android_library(context: &BuildScriptContext, args: &Arguments) -> Resu
         (inputs, sdk)
     } else {
         let build = AndroidBuild::prepare(inputs, args, build_type)?;
+
+        if context.idea {
+            build.write_idea_module(&context.project_dir, args)?;
+        }
+
         let intermediates = build.build_dir.join("intermediates");
         let manifest = intermediates.join("manifest/AndroidManifest.xml");
         build.write_manifest(

@@ -10,6 +10,7 @@ use crate::language::runtime::{
 };
 
 use super::JvmLaunch;
+use super::idea::{self, IdeaModule};
 use super::jar_merge::{self, JarContents};
 use super::maven::TargetPlatform;
 use super::module::{
@@ -79,7 +80,7 @@ fn build_module(
     }
 
     let main_class = args.get::<Option<String>>("main_class")?;
-    let (jar, artifact) = build_jar(&inputs, args, main_class.as_deref())?;
+    let (jar, artifact) = build_jar(context, &inputs, args, main_class.as_deref())?;
 
     let unit_tests = UnitTests {
         inputs: &inputs,
@@ -112,6 +113,7 @@ fn build_module(
 
 /// The jar of the module and the artifact: the fat jar with fat_jar = true, else that jar
 fn build_jar(
+    context: &BuildScriptContext,
     inputs: &ModuleBuildInputs,
     args: &Arguments,
     main_class: Option<&str>,
@@ -169,7 +171,12 @@ fn build_jar(
 
     let fingerprint = inputs.input_fingerprint(&inputs.name, args, &inputs.resources.inputs())?;
 
-    if inputs.is_up_to_date(&fingerprint, &[&jar, &artifact])? {
+    // a missing IntelliJ module file builds the module again
+    let idea_file = context.idea.then(|| idea::module_file(&context.project_dir, &inputs.name));
+    let mut outputs = vec![jar.as_path(), artifact.as_path()];
+    outputs.extend(idea_file.as_deref());
+
+    if inputs.is_up_to_date(&fingerprint, &outputs)? {
         return Ok((jar, artifact));
     }
 
@@ -185,6 +192,19 @@ fn build_jar(
             "{} is an Android library, use build_android",
             aar.display()
         ));
+    }
+
+    // before compiling: IntelliJ sees new libraries even while the code does not compile
+    if context.idea {
+        let module = IdeaModule {
+            inputs,
+            resolved: &resolved,
+            platform: TargetPlatform::Jvm,
+            libraries: &resolved.libraries,
+            compile_only: &resolved.compile_only,
+            generated_dirs: &[],
+        };
+        idea::write_module(&context.project_dir, args, &module)?;
     }
 
     let mut classpath = resolved.libraries.clone();

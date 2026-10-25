@@ -1,6 +1,7 @@
 // JVM: Kotlin and Java modules and Android apps, built with tools and libraries from Maven repositories
 pub mod android;
 mod generator;
+pub mod idea;
 pub mod install;
 mod jar;
 mod jar_merge;

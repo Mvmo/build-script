@@ -276,8 +276,8 @@ enum EngineVersion {
     Fixed(&'static str),
 }
 
-struct TestLibraries {
-    files: Vec<PathBuf>,
+pub struct TestLibraries {
+    pub files: Vec<PathBuf>,
     /// None when the tests do not run on the JUnit Platform
     console_launcher_version: Option<String>,
     /// jars of the javac processors for the tests and what they need
@@ -287,7 +287,7 @@ struct TestLibraries {
 
 /// The libraries of the module and its tests in one resolution, so versions agree, plus
 /// what the JUnit Platform and the test processors need. Of aars only their jars count.
-fn resolve_test_libraries(
+pub fn resolve_test_libraries(
     inputs: &ModuleBuildInputs,
     test_dependencies: &Dependencies,
     symbol_processors: &SymbolProcessors,

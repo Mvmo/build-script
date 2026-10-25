@@ -40,6 +40,8 @@ pub struct BuildScriptContext {
     pub tests: TestSelection,
     /// `build-script build --release`: Android apps are built for release
     pub release: bool,
+    /// modules write their module files for IntelliJ, see `build-script idea`
+    pub idea: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +112,7 @@ impl Runtime {
                 project_dir,
                 tests: TestSelection::None,
                 release: false,
+                idea: false,
             },
             built: vec![],
             jobs: Arc::new(Jobs::new(default_jobs())),
@@ -133,6 +136,11 @@ impl Runtime {
 
     pub fn with_release(mut self, release: bool) -> Self {
         self.context.release = release;
+        return self;
+    }
+
+    pub fn with_idea(mut self, idea: bool) -> Self {
+        self.context.idea = idea;
         return self;
     }
 

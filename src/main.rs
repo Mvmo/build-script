@@ -11,6 +11,7 @@ use language::parser::Parser;
 use language::runtime::{self, BuiltModule, Runtime, TestCounts, TestOutcome, TestSelection};
 
 const USAGE: &str = "usage: build-script [build] [<script>]
+       build-script idea [<script>]
        build-script run [--module <name>] [<script>] [-- <args>...]
        build-script test [--module <name>] [<script>]
        build-script new <kind> <path> [--package <package>]
@@ -30,6 +31,10 @@ const DEFAULT_SCRIPT: &str = "project.build";
 enum Command {
     Help,
     Build {
+        script: String,
+    },
+    /// builds, sets up the project for IntelliJ, later builds keep it current
+    Idea {
         script: String,
     },
     /// builds, then starts a module, the last startable one by default
@@ -92,6 +97,11 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         "--help" | "-h" | "help" if rest.is_empty() => return Ok(Command::Help),
         "build" => {
             return Ok(Command::Build {
+                script: script_or_default(rest)?,
+            });
+        }
+        "idea" => {
+            return Ok(Command::Idea {
                 script: script_or_default(rest)?,
             });
         }
@@ -238,6 +248,8 @@ fn help() -> String {
     return format!(
         "
   build   builds every module of the script, modules that did not change are up to date
+  idea    builds and sets the project up for IntelliJ: a module file per module in .idea,
+          every build after keeps them current
   run     builds, then starts a module: the last one with a main_class or the last
           Android app, or the one --module names; arguments after -- go to the program
   test    builds, then compiles and runs the tests of every module, or of one; failing
@@ -352,9 +364,10 @@ fn main() {
             exit_on_error(project::clean(Path::new(script)));
             return;
         }
-        Command::Build { script } | Command::Run { script, .. } | Command::Test { script, .. } => {
-            script.as_str()
-        }
+        Command::Build { script }
+        | Command::Idea { script }
+        | Command::Run { script, .. }
+        | Command::Test { script, .. } => script.as_str(),
     };
 
     let tests = match &command {
@@ -367,7 +380,8 @@ fn main() {
     };
 
     let jobs = options.jobs.unwrap_or_else(runtime::default_jobs);
-    let modules = run_script(script_path, tests, jobs, options.release);
+    let set_up_idea = matches!(command, Command::Idea { .. });
+    let modules = run_script(script_path, tests, jobs, options.release, set_up_idea);
 
     match &command {
         Command::Run { module, args, .. } => {
@@ -429,6 +443,7 @@ fn run_script(
     tests: TestSelection,
     jobs: usize,
     release: bool,
+    set_up_idea: bool,
 ) -> Vec<Arc<BuiltModule>> {
     let source = std::fs::read_to_string(script_path).unwrap_or_else(|error| {
         eprintln!("could not read {script_path}: {error}");
@@ -451,14 +466,41 @@ fn run_script(
         .map(|parent| parent.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut runtime = Runtime::new(project_dir)
+    // once `build-script idea` set it up, every build keeps IntelliJ current, release builds leave it
+    let marker = project_dir.join(jvm::idea::MARKER);
+
+    if set_up_idea {
+        exit_on_error(common::system::write_file(&marker, jvm::idea::MARKER_TEXT));
+    }
+
+    let idea = !release && marker.is_file();
+
+    let mut runtime = Runtime::new(project_dir.clone())
         .with_tests(tests)
         .with_jobs(jobs)
-        .with_release(release);
+        .with_release(release)
+        .with_idea(idea);
     let evaluated = runtime.run(&script);
 
     // builds that started before an error finish, none of their tools keep running
     let built = runtime.finish();
+
+    // a failed build keeps the module files of every module
+    let worked = built.as_deref().ok().filter(|_| evaluated.is_ok());
+
+    if idea && let Err(error) = jvm::idea::write_project(&project_dir, worked) {
+        eprintln!("could not write the IntelliJ project: {error}");
+    }
+
+    if set_up_idea && worked.is_some() {
+        println!(
+            "Open {} in IntelliJ. A JDK it does not know yet, like temurin-21, is in {}: add it under Project Structure > SDKs with that name.",
+            std::fs::canonicalize(&project_dir)
+                .unwrap_or(project_dir)
+                .display(),
+            common::system::data_dir("jdks").display()
+        );
+    }
 
     let errors = match (evaluated, built) {
         (Ok(()), Ok(modules)) => return modules,
