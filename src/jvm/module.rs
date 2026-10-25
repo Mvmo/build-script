@@ -25,7 +25,7 @@ pub const DEFAULT_KOTLIN_VERSION: &str = "2.4.21";
 
 const KOTLIN_COMPILER_MAIN_CLASS: &str = "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler";
 /// bytecode level handed to d8, the default of current Android Gradle plugins
-const ANDROID_JVM_TARGET: &str = "17";
+pub const ANDROID_JVM_TARGET: &str = "17";
 /// Short names for plugins of Kotlin itself: artifact of org.jetbrains.kotlin, runtime library, options
 const KOTLIN_COMPILER_PLUGINS: &[(&str, &str, Option<&str>, &[&str])] = &[
     (
