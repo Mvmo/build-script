@@ -365,3 +365,61 @@ fn write_if_changed(file: &Path, content: &str) -> Result<(), String> {
     return system::write_file(file, content);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jvm::JvmOutput;
+    use crate::language::runtime::ModuleOutput;
+
+    #[test]
+    fn paths_like_intellij_writes_them() {
+        let project = Path::new("/work/shop");
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+
+        assert_eq!(idea_path(project, Path::new("/work/shop/app/src")), "$MODULE_DIR$/../../app/src");
+        assert_eq!(idea_path(project, Path::new("/work/shop/./app/../core")), "$MODULE_DIR$/../../core");
+        assert_eq!(idea_path(project, project), "$MODULE_DIR$/../..");
+        assert_eq!(idea_path(project, &home.join(".build-script/a.jar")), "$USER_HOME$/.build-script/a.jar");
+        assert_eq!(idea_path(project, Path::new("/opt/jdk")), "/opt/jdk");
+    }
+
+    #[test]
+    fn modules_gone_from_the_script_lose_their_file_after_a_build_that_worked() {
+        let project = std::env::temp_dir().join(format!("build-script-idea-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&project);
+
+        let modules_dir = project.join(".idea/modules");
+        system::write_file(&modules_dir.join("gone.iml"), "<module/>").unwrap();
+        system::write_file(&modules_dir.join("app.iml"), "<module/>").unwrap();
+
+        // a failed build keeps every file
+        write_project(&project, None).unwrap();
+        let modules_xml = system::read_file(&project.join(".idea/modules.xml")).unwrap();
+        assert!(modules_xml.contains("$PROJECT_DIR$/.idea/modules/gone.iml"));
+
+        let app = Arc::new(BuiltModule {
+            name: "app".to_string(),
+            directory: project.join("app"),
+            artifact: project.join("app/build/libs/app.jar"),
+            modules: vec![],
+            output: ModuleOutput::Jvm(JvmOutput {
+                classes: None,
+                libraries: vec![],
+                platforms: vec![],
+                android: None,
+                launch: None,
+            }),
+            tests: vec![],
+        });
+
+        write_project(&project, Some(&[app])).unwrap();
+
+        let root = project.file_name().unwrap().to_string_lossy().to_string();
+        assert!(!modules_dir.join("gone.iml").exists());
+        assert!(modules_dir.join("app.iml").is_file());
+        // the script lives outside the modules
+        assert!(modules_dir.join(format!("{root}.iml")).is_file());
+
+        fs::remove_dir_all(&project).unwrap();
+    }
+}
