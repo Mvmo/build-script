@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 
 use crate::common::xml::{self, XmlElement};
 use crate::common::{system, up_to_date};
+use crate::jvm::idea::{self, IdeaModule};
 use crate::jvm::jdk::Jdk;
 use crate::jvm::maven::{DependencyResolver, MavenCoordinate, TargetPlatform};
 use crate::jvm::module::{
@@ -1206,6 +1207,28 @@ impl AndroidBuild {
             BuildType::Debug => "--debug",
             BuildType::Release => "--release",
         };
+    }
+
+    /// The module file for IntelliJ: the jars of the aars, android.jar, the R and BuildConfig classes
+    pub fn write_idea_module(&self, project_dir: &Path, args: &Arguments) -> Result<(), String> {
+        let generated = self.build_dir.join("intermediates/generated");
+        let generated_dirs = ["r", "buildconfig", "aidl", "viewbinding"].map(|kind| generated.join(kind));
+
+        // library modules are modules of IntelliJ, not jars
+        let libraries = unique(self.jars.iter().filter(|jar| !self.module_jars.contains(jar)));
+        let mut compile_only = self.compile_only.clone();
+        compile_only.push(self.sdk.android_jar.clone());
+
+        let module = IdeaModule {
+            inputs: &self.inputs,
+            resolved: &self.resolved,
+            platform: TargetPlatform::Android,
+            libraries: &libraries,
+            compile_only: &compile_only,
+            generated_dirs: &generated_dirs,
+        };
+
+        return idea::write_module(project_dir, args, &module);
     }
 
     /// The ProGuard rules the aars and library modules bring for the apps using them
